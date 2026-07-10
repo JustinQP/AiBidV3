@@ -39,7 +39,7 @@ paths:
     get:
       tags: [Health]
       operationId: getHealth
-      summary: 检查 API 存活状态
+      summary: 检查 API、Repository 与对象存储就绪状态
       responses:
         "200":
           description: API 正常运行
@@ -47,6 +47,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/Problem"
 
   /api/v1/projects:
     parameters:
@@ -155,6 +157,9 @@ paths:
         接收名为 `file` 的 multipart 文件。文件与任务记录持久化成功后立即
         返回 `202 Accepted`；解析结果通过任务资源轮询，不在本请求中返回。
 
+        新上传会先写入对象存储，再以数据库事务创建文件元数据与任务。对象
+        存储不可用时返回 `503`，且不会创建文件或任务记录。
+
         第一阶段解析结果来自明确标注的开发适配器，不是对原文件内容的真实解析。
       requestBody:
         required: true
@@ -185,6 +190,8 @@ paths:
         "413":
           $ref: "#/components/responses/Problem"
         "415":
+          $ref: "#/components/responses/Problem"
+        "503":
           $ref: "#/components/responses/Problem"
         default:
           $ref: "#/components/responses/Problem"

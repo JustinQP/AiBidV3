@@ -7,7 +7,7 @@ import type {
   Requirement,
   RequirementConfirmation,
   RequirementFilters,
-  StoredProjectFile,
+  StoredProjectFileRecord,
 } from './models.js'
 
 export interface BidRepository {
@@ -22,7 +22,7 @@ export interface BidRepository {
 
   createUpload(upload: NewUpload): Promise<{ file: ProjectFile; task: ParseTask }>
   listProjectFiles(tenantId: string, projectId: string): Promise<ProjectFile[]>
-  findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFile | null>
+  findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFileRecord | null>
 
   listProjectTasks(tenantId: string, projectId: string): Promise<ParseTask[]>
   findTask(tenantId: string, taskId: string): Promise<ParseTask | null>

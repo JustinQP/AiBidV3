@@ -1,5 +1,7 @@
 import type { BidRepository } from '../domain/repository.js'
+import { AppError } from '../lib/app-error.js'
 import type { DevelopmentDocumentParser } from './development-document-parser.js'
+import type { FileContentLoader } from './file-content-loader.js'
 
 interface ProcessingErrorContext {
   tenantId: string
@@ -18,6 +20,7 @@ export class UploadProcessingService {
 
   constructor(
     private readonly repository: BidRepository,
+    private readonly fileContentLoader: FileContentLoader,
     private readonly parser: DevelopmentDocumentParser,
     private readonly delayMs: number,
     private readonly reportError: (error: unknown, context: ProcessingErrorContext) => void = () => undefined,
@@ -33,12 +36,13 @@ export class UploadProcessingService {
     const work = this.process(tenantId, taskId)
       .catch(async (error: unknown) => {
         this.reportError(error, { tenantId, taskId, stage: 'process' })
+        const code = error instanceof AppError ? error.code : 'DEVELOPMENT_PARSER_FAILED'
         const message = error instanceof Error ? error.message : 'Unknown development parser failure'
         try {
           await this.repository.failTask(
             tenantId,
             taskId,
-            { code: 'DEVELOPMENT_PARSER_FAILED', message },
+            { code, message },
             new Date().toISOString(),
           )
         } catch (persistenceError) {
@@ -65,7 +69,7 @@ export class UploadProcessingService {
     const startedAt = new Date().toISOString()
     const task = await this.repository.markTaskRunning(tenantId, taskId, startedAt)
     if (!task) return
-    const file = await this.repository.findStoredFile(tenantId, task.fileId)
+    const file = await this.fileContentLoader.loadForProcessing(tenantId, task.fileId)
     if (!file) throw new Error('Uploaded file disappeared before development parsing')
     const completedAt = new Date().toISOString()
     const requirements = await this.parser.parse(file, task.id, completedAt)
