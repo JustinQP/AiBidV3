@@ -27,7 +27,7 @@ V0.1 高保真 Web 原型位于 [`frontend/`](frontend/)，默认仍使用 Mock 
 - PostgreSQL、Redis、MinIO 的本地 Compose 编排；
 - OpenAPI 契约和 MVP 技术方案。
 
-当前解析器只生成明确标记的固定开发数据，不读取真实文件；上传内容暂存 PostgreSQL `bytea`。前端页面尚未切换到 API，生产级认证授权、S3 文件存储、独立 worker、真实解析和正式 DOCX 渲染仍待后续阶段实现。
+当前解析器只生成明确标记的固定开发数据，不读取真实文件；上传内容暂存 PostgreSQL `bytea`。前端已接通“项目创建 → 文件上传与任务轮询 → 解析结果 → 人工确认/驳回”的真实 API 纵向切片，默认仍使用 Mock 数据以保留完整演示流程。生产级认证授权、S3 文件存储、独立 worker、真实解析和正式 DOCX 渲染仍待后续阶段实现。
 
 ## 快速开始
 
@@ -40,6 +40,8 @@ npm run dev
 ```
 
 默认地址：`http://localhost:4173`
+
+如需验证真实 API 纵向切片，先启动后端，再复制 `frontend/.env.example` 为 `frontend/.env.local`，将 `VITE_DATA_SOURCE` 改为 `api` 后启动前端。API 模式目前只开放真实项目的“招标文件”和“智能解析”；`/projects/demo/*` 始终保留完整 Mock 演示。
 
 运行第一阶段 API 与本地基础设施：
 

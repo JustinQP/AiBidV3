@@ -33,6 +33,8 @@ export default function App() {
           <Route path="/projects/demo/review" element={<ReviewPage />} />
           <Route path="/projects/demo/export" element={<ExportPage />} />
           <Route path="/projects/demo/settings" element={<PlaceholderPage type="settings" />} />
+          <Route path="/projects/:projectId/files" element={<FilesPage />} />
+          <Route path="/projects/:projectId/analysis" element={<AnalysisPage />} />
           <Route path="/knowledge" element={<PlaceholderPage type="knowledge" />} />
           <Route path="/templates" element={<PlaceholderPage type="templates" />} />
           <Route path="/tasks" element={<PlaceholderPage type="tasks" />} />

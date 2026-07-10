@@ -23,7 +23,8 @@ import {
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { project } from '../data/mock'
+import { useCurrentProjectId, isDemoProjectId, projectRoute } from '../api/routing'
+import { useProjectDetail } from '../api/hooks'
 import { usePrototype } from '../context/PrototypeContext'
 import { ToastViewport } from './ToastViewport'
 
@@ -54,17 +55,30 @@ function Brand({ compact = false }: { compact?: boolean }) {
 export function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation()
   const navigate = useNavigate()
-  const { resetDemo } = usePrototype()
+  const { notify, resetDemo } = usePrototype()
   const [mobileOpen, setMobileOpen] = useState(false)
-  const inProject = /^\/projects\/demo\//.test(location.pathname)
+  const projectId = useCurrentProjectId()
+  const { project, loading: projectLoading, error: projectError } = useProjectDetail(projectId)
+  const inProject = projectId !== null
+  const fullWorkflowEnabled = isDemoProjectId(projectId)
   const writing = location.pathname.includes('/write/')
+  const projectName = project?.name ?? (projectLoading ? '正在加载项目…' : projectError ? '项目加载失败' : '未命名项目')
+  const projectCode = project?.code ?? '项目编号待补充'
+
+  const explainUnavailableModule = (label: string) => {
+    notify({
+      title: `${label}将在后续接入`,
+      description: '当前真实数据闭环仅开放招标文件与智能解析，演示项目仍可体验完整流程。',
+      tone: 'info',
+    })
+  }
 
   return (
     <div className={`app-shell ${writing ? 'writing-shell' : ''}`}>
       <button className="mobile-menu-trigger" onClick={() => setMobileOpen(true)} aria-label="打开导航"><Menu size={20} /></button>
       {mobileOpen ? <button className="mobile-nav-backdrop" onClick={() => setMobileOpen(false)} aria-label="关闭导航" /> : null}
       <aside className={`global-sidebar ${writing ? 'global-sidebar-compact' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
-        <div className="mobile-nav-close"><button onClick={() => setMobileOpen(false)}><X size={20} /></button></div>
+        <div className="mobile-nav-close"><button onClick={() => setMobileOpen(false)} aria-label="关闭导航"><X size={20} /></button></div>
         <Brand compact={writing} />
         <nav>
           {globalNav.map(({ label, to, icon: Icon }) => (
@@ -83,15 +97,32 @@ export function AppShell({ children }: { children: ReactNode }) {
         <aside className="project-sidebar">
           <div className="project-switcher">
             <button onClick={() => navigate('/projects')}><ChevronLeft size={15} />返回项目中心</button>
-            <h2>{project.name}</h2>
-            <p>{project.code}</p>
+            <h2>{projectName}</h2>
+            <p>{projectCode}</p>
           </div>
           <nav>
-            {projectNav.map(({ label, path, icon: Icon }) => (
-              <NavLink key={path} to={`/projects/demo/${path}`} className={({ isActive }) => isActive ? 'active' : ''}>
-                <Icon size={18} /><span>{label}</span>
-              </NavLink>
-            ))}
+            {projectNav.map(({ label, path, icon: Icon }) => {
+              const available = fullWorkflowEnabled || path === 'files' || path === 'analysis'
+              const to = projectRoute(projectId, path as Parameters<typeof projectRoute>[1])
+              return available ? (
+                <NavLink key={path} to={to} className={({ isActive }) => isActive ? 'active' : ''}>
+                  <Icon size={18} /><span>{label}</span>
+                </NavLink>
+              ) : (
+                <a
+                  key={path}
+                  href={to}
+                  aria-disabled="true"
+                  title="后续版本接入真实数据"
+                  onClick={(event) => {
+                    event.preventDefault()
+                    explainUnavailableModule(label)
+                  }}
+                >
+                  <Icon size={18} /><span>{label}</span>
+                </a>
+              )
+            })}
           </nav>
           <button className="project-collapse"><PanelLeftClose size={17} />收起项目导航</button>
         </aside>
@@ -100,7 +131,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <div className="app-main">
         {!writing ? (
           <header className="topbar">
-            <div className="topbar-title">{inProject ? <><span>项目中心</span><i>/</i><strong>{project.name}</strong></> : <strong>智标云工作台</strong>}</div>
+            <div className="topbar-title">{inProject ? <><span>项目中心</span><i>/</i><strong>{projectName}</strong></> : <strong>智标云工作台</strong>}</div>
             <div className="topbar-actions">
               <button aria-label="通知"><Bell size={18} /><i className="notification-dot" /></button>
               <button aria-label="帮助"><CircleHelp size={18} /></button>

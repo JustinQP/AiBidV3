@@ -37,6 +37,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
 
   await app.register(cors, {
     origin: config.corsOrigins,
+    methods: ['GET', 'HEAD', 'POST', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['content-type', 'x-tenant-id'],
   })
   await app.register(multipart, {
