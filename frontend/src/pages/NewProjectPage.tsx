@@ -10,8 +10,11 @@ import {
   Sparkles,
   UserRoundPlus,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { ApiError } from '../api/client'
+import { useProjectList } from '../api/hooks'
+import { projectRoute } from '../api/routing'
 import { Badge, Button, InlineMessage, Modal, PageHeader, ProgressBar, Select } from '../components/ui'
 import { usePrototype } from '../context/PrototypeContext'
 
@@ -33,6 +36,11 @@ interface ProjectDraft {
   writers: string[]
 }
 
+interface CreationFailure {
+  detail: string
+  requestId?: string
+}
+
 const initialDraft: ProjectDraft = {
   name: '智慧园区数字化平台建设项目',
   code: 'ZHYQ-2026-017',
@@ -51,6 +59,24 @@ const initialDraft: ProjectDraft = {
   writers: ['李明', '陈晨'],
 }
 
+const apiInitialDraft: ProjectDraft = {
+  ...initialDraft,
+  name: '',
+  code: '',
+  purchaser: '',
+  tenderNo: '',
+  packageNo: '',
+  industry: '',
+  region: '',
+  budget: '',
+  deadline: '',
+  secrecy: '内部',
+  template: '暂不选择模板',
+  owner: '',
+  reviewer: '',
+  writers: [],
+}
+
 const steps = [
   { title: '项目信息', description: '基本信息与关键日期', icon: FolderKanban },
   { title: '模板与模型', description: '确定输出与 AI 策略', icon: Sparkles },
@@ -65,25 +91,73 @@ const templates = [
 
 const availableWriters = ['李明', '陈晨', '周宁', '赵敏']
 
+function localDateTimeToRfc3339(value: string): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value)
+  if (!match) return null
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0'] = match
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  const second = Number(secondText)
+  const date = new Date(year, month - 1, day, hour, minute, second)
+
+  if (
+    Number.isNaN(date.valueOf())
+    || date.getFullYear() !== year
+    || date.getMonth() !== month - 1
+    || date.getDate() !== day
+    || date.getHours() !== hour
+    || date.getMinutes() !== minute
+    || date.getSeconds() !== second
+  ) return null
+
+  return date.toISOString()
+}
+
+function toCreationFailure(error: unknown): CreationFailure {
+  if (error instanceof ApiError) {
+    return {
+      detail: error.problem.detail || error.message || '请稍后重试。',
+      requestId: error.problem.requestId,
+    }
+  }
+  return { detail: error instanceof Error ? error.message : '请稍后重试。' }
+}
+
 export function NewProjectPage() {
   const navigate = useNavigate()
   const { notify } = usePrototype()
+  const { source, creating, createProject } = useProjectList({ load: false })
+  const mountedRef = useRef(true)
   const [step, setStep] = useState(0)
-  const [draft, setDraft] = useState<ProjectDraft>(initialDraft)
+  const [draft, setDraft] = useState<ProjectDraft>(() => source === 'api' ? apiInitialDraft : initialDraft)
   const [showValidation, setShowValidation] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const [creationFailure, setCreationFailure] = useState<CreationFailure | null>(null)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const updateDraft = <K extends keyof ProjectDraft>(field: K, value: ProjectDraft[K]) => {
+    setCreationFailure(null)
     setDraft((current) => ({ ...current, [field]: value }))
   }
 
   const requiredMissing = !draft.name.trim() || !draft.code.trim() || !draft.purchaser.trim() || !draft.deadline
-  const memberMissing = !draft.owner || !draft.reviewer || draft.writers.length === 0
+  const deadlineInvalid = draft.deadline.length > 0 && localDateTimeToRfc3339(draft.deadline) === null
+  const memberMissing = !draft.owner || (source === 'mock' && (!draft.reviewer || draft.writers.length === 0))
 
   const nextStep = () => {
-    if (step === 0 && requiredMissing) {
+    if (step === 0 && (requiredMissing || deadlineInvalid)) {
       setShowValidation(true)
-      notify({ title: '请完善必填信息', description: '项目名称、项目编码、招标人和截止时间不能为空。', tone: 'warning' })
+      notify({ title: '请完善必填信息', description: deadlineInvalid ? '请填写有效的投标截止时间。' : '项目名称、项目编码、招标人和截止时间不能为空。', tone: 'warning' })
       return
     }
     setShowValidation(false)
@@ -97,22 +171,69 @@ export function NewProjectPage() {
   }
 
   const saveDraft = () => {
+    if (source === 'api') {
+      notify({ title: '服务端草稿暂未接入', description: '当前内容仅在本次创建过程中保留，请完成创建后再上传文件。', tone: 'warning' })
+      return
+    }
     notify({ title: '草稿已保存', description: '项目配置已保存，可稍后从项目中心继续创建。', tone: 'success' })
   }
 
   const requestCreate = () => {
-    if (memberMissing) {
+    if (deadlineInvalid) {
       setShowValidation(true)
-      notify({ title: '请完成成员配置', description: '至少需要项目负责人、审核人和一名编写人。', tone: 'warning' })
+      setStep(0)
+      notify({ title: '截止时间无效', description: '请重新选择投标截止时间后再创建项目。', tone: 'warning' })
       return
     }
+    if (memberMissing) {
+      setShowValidation(true)
+      notify({
+        title: '请完成成员配置',
+        description: source === 'api' ? '请选择将写入项目记录的负责人。' : '至少需要项目负责人、审核人和一名编写人。',
+        tone: 'warning',
+      })
+      return
+    }
+    setCreationFailure(null)
     setConfirmOpen(true)
   }
 
-  const confirmCreate = () => {
-    setConfirmOpen(false)
-    notify({ title: '项目创建成功', description: '已建立项目空间，现在上传招标文件开始智能解析。', tone: 'success' })
-    navigate('/projects/demo/files')
+  const confirmCreate = async () => {
+    if (source === 'mock') {
+      setConfirmOpen(false)
+      notify({ title: '项目创建成功', description: '已建立项目空间，现在上传招标文件开始智能解析。', tone: 'success' })
+      navigate(projectRoute('demo', 'files'))
+      return
+    }
+
+    const deadline = localDateTimeToRfc3339(draft.deadline)
+    if (!deadline) {
+      setConfirmOpen(false)
+      setShowValidation(true)
+      setStep(0)
+      notify({ title: '截止时间无效', description: '请重新选择投标截止时间。', tone: 'warning' })
+      return
+    }
+
+    setCreationFailure(null)
+    try {
+      const created = await createProject({
+        name: draft.name.trim(),
+        code: draft.code.trim(),
+        customerName: draft.purchaser.trim(),
+        ownerName: draft.owner.trim(),
+        deadline,
+      })
+      if (!mountedRef.current) return
+      setConfirmOpen(false)
+      notify({ title: '项目创建成功', description: '核心项目信息已保存，现在上传招标文件。', tone: 'success' })
+      navigate(projectRoute(created.id, 'files'))
+    } catch (error) {
+      if (!mountedRef.current) return
+      const failure = toCreationFailure(error)
+      setCreationFailure(failure)
+      notify({ title: '项目创建失败', description: failure.detail, tone: 'error' })
+    }
   }
 
   return (
@@ -144,9 +265,15 @@ export function NewProjectPage() {
               )
             })}
           </ol>
-          <InlineMessage tone="info" title="创建后仍可调整">
-            模板、模型和项目成员可在项目设置中修改，关键变更会进入审计记录。
-          </InlineMessage>
+          {source === 'api' ? (
+            <InlineMessage tone="warning" title="当前持久化范围">
+              本阶段仅保存项目名称、编码、招标人、负责人和截止时间；招标编号、标包、行业、地区、预算、保密等级、模板、模型、审核人和编写人暂不提交到后端。
+            </InlineMessage>
+          ) : (
+            <InlineMessage tone="info" title="创建后仍可调整">
+              模板、模型和项目成员可在项目设置中修改，关键变更会进入审计记录。
+            </InlineMessage>
+          )}
         </aside>
 
         <section className="wizard-form panel">
@@ -156,13 +283,13 @@ export function NewProjectPage() {
               <div className="wizard-form-body form-grid two">
                 <label className={`field field-wide ${showValidation && !draft.name.trim() ? 'field-error' : ''}`}>
                   <span>项目名称 *</span>
-                  <input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} placeholder="请输入正式项目名称" />
-                  {showValidation && !draft.name.trim() ? <small>请输入项目名称</small> : null}
+                  <input id="project-name" required aria-invalid={showValidation && !draft.name.trim()} aria-describedby={showValidation && !draft.name.trim() ? 'project-name-error' : undefined} value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} placeholder="请输入正式项目名称" />
+                  {showValidation && !draft.name.trim() ? <small id="project-name-error">请输入项目名称</small> : null}
                 </label>
                 <label className={`field ${showValidation && !draft.code.trim() ? 'field-error' : ''}`}>
                   <span>项目编码 *</span>
-                  <input value={draft.code} onChange={(event) => updateDraft('code', event.target.value)} />
-                  {showValidation && !draft.code.trim() ? <small>请输入企业内部项目编码</small> : null}
+                  <input id="project-code" required aria-invalid={showValidation && !draft.code.trim()} aria-describedby={showValidation && !draft.code.trim() ? 'project-code-error' : undefined} value={draft.code} onChange={(event) => updateDraft('code', event.target.value)} />
+                  {showValidation && !draft.code.trim() ? <small id="project-code-error">请输入企业内部项目编码</small> : null}
                 </label>
                 <label className="field">
                   <span>招标编号</span>
@@ -170,8 +297,8 @@ export function NewProjectPage() {
                 </label>
                 <label className={`field field-wide ${showValidation && !draft.purchaser.trim() ? 'field-error' : ''}`}>
                   <span>招标人 / 采购人 *</span>
-                  <input value={draft.purchaser} onChange={(event) => updateDraft('purchaser', event.target.value)} />
-                  {showValidation && !draft.purchaser.trim() ? <small>请输入招标人或采购人</small> : null}
+                  <input id="project-customer" required aria-invalid={showValidation && !draft.purchaser.trim()} aria-describedby={showValidation && !draft.purchaser.trim() ? 'project-customer-error' : undefined} value={draft.purchaser} onChange={(event) => updateDraft('purchaser', event.target.value)} />
+                  {showValidation && !draft.purchaser.trim() ? <small id="project-customer-error">请输入招标人或采购人</small> : null}
                 </label>
                 <label className="field field-wide">
                   <span>标包信息</span>
@@ -189,10 +316,10 @@ export function NewProjectPage() {
                   <span>预算金额（万元）</span>
                   <div className="input-suffix"><input type="number" min="0" value={draft.budget} onChange={(event) => updateDraft('budget', event.target.value)} /><span>CNY</span></div>
                 </label>
-                <label className={`field ${showValidation && !draft.deadline ? 'field-error' : ''}`}>
+                <label className={`field ${showValidation && (!draft.deadline || deadlineInvalid) ? 'field-error' : ''}`}>
                   <span>投标截止时间 *</span>
-                  <input type="datetime-local" value={draft.deadline} onChange={(event) => updateDraft('deadline', event.target.value)} />
-                  {showValidation && !draft.deadline ? <small>请选择投标截止时间</small> : null}
+                  <input id="project-deadline" type="datetime-local" required aria-invalid={showValidation && (!draft.deadline || deadlineInvalid)} aria-describedby={showValidation && (!draft.deadline || deadlineInvalid) ? 'project-deadline-error' : undefined} value={draft.deadline} onChange={(event) => updateDraft('deadline', event.target.value)} />
+                  {showValidation && (!draft.deadline || deadlineInvalid) ? <small id="project-deadline-error">{deadlineInvalid ? '请选择有效的截止时间' : '请选择投标截止时间'}</small> : null}
                 </label>
                 <label className="field">
                   <span>保密等级</span>
@@ -212,7 +339,7 @@ export function NewProjectPage() {
                 <div className="choice-grid">
                   {templates.map((template) => (
                     <label key={template.name} className={`choice-card ${draft.template === template.name ? 'selected' : ''}`}>
-                      <input type="radio" name="template" checked={draft.template === template.name} onChange={() => updateDraft('template', template.name)} />
+                      <input type="radio" name="template" disabled={source === 'api'} checked={draft.template === template.name} onChange={() => updateDraft('template', template.name)} />
                       <span className="choice-card-icon"><FileUp size={21} /></span>
                       <span><strong>{template.name}</strong><small>{template.meta}</small></span>
                       {template.recommended ? <Badge tone="teal">推荐</Badge> : null}
@@ -222,12 +349,12 @@ export function NewProjectPage() {
                 <div className="form-grid compact-form-grid">
                   <label className="field field-wide">
                     <span>默认模型配置</span>
-                    <Select value={draft.model} onChange={(event) => updateDraft('model', event.target.value)}>
+                    <Select value={draft.model} disabled={source === 'api'} onChange={(event) => updateDraft('model', event.target.value)}>
                       <option>企业写作模型（推荐）</option>
                       <option>高精度分析模型</option>
                       <option>私有化通用模型</option>
                     </Select>
-                    <small className="field-help">用于解析、章节生成和合规检查；实际调用会记录模型与提示词版本。</small>
+                    <small className="field-help">{source === 'api' ? '模板与模型配置将在后续接口接入，当前不会保存。' : '用于解析、章节生成和合规检查；实际调用会记录模型与提示词版本。'}</small>
                   </label>
                 </div>
                 <InlineMessage tone="success" title="已启用来源追溯">
@@ -244,18 +371,20 @@ export function NewProjectPage() {
               <div className="form-grid two">
                 <label className={`field ${showValidation && !draft.owner ? 'field-error' : ''}`}>
                   <span>项目负责人 *</span>
-                  <Select value={draft.owner} onChange={(event) => updateDraft('owner', event.target.value)}>
+                  <Select required aria-invalid={showValidation && !draft.owner} value={draft.owner} onChange={(event) => updateDraft('owner', event.target.value)}>
+                    <option value="" disabled>请选择负责人</option>
                     <option>张伟</option><option>赵敏</option><option>王芳</option>
                   </Select>
                 </label>
-                <label className={`field ${showValidation && !draft.reviewer ? 'field-error' : ''}`}>
-                  <span>默认审核人 *</span>
-                  <Select value={draft.reviewer} onChange={(event) => updateDraft('reviewer', event.target.value)}>
+                <label className={`field ${showValidation && source === 'mock' && !draft.reviewer ? 'field-error' : ''}`}>
+                  <span>默认审核人{source === 'api' ? '（暂不保存）' : ' *'}</span>
+                  <Select value={draft.reviewer} disabled={source === 'api'} onChange={(event) => updateDraft('reviewer', event.target.value)}>
+                    <option value="" disabled>待后续配置</option>
                     <option>王芳</option><option>张伟</option><option>赵敏</option>
                   </Select>
                 </label>
-                <fieldset className={`field field-wide member-picker ${showValidation && draft.writers.length === 0 ? 'field-error' : ''}`}>
-                  <legend>章节编写人 *</legend>
+                <fieldset disabled={source === 'api'} className={`field field-wide member-picker ${showValidation && source === 'mock' && draft.writers.length === 0 ? 'field-error' : ''}`}>
+                  <legend>章节编写人{source === 'api' ? '（暂不保存）' : ' *'}</legend>
                   <div className="member-options">
                     {availableWriters.map((name) => (
                       <label key={name} className={draft.writers.includes(name) ? 'selected' : ''}>
@@ -264,14 +393,14 @@ export function NewProjectPage() {
                       </label>
                     ))}
                   </div>
-                  {showValidation && draft.writers.length === 0 ? <small>请至少选择一名章节编写人</small> : null}
+                  {source === 'api' ? <small>成员分工接口将在后续阶段接入。</small> : showValidation && draft.writers.length === 0 ? <small>请至少选择一名章节编写人</small> : null}
                 </fieldset>
               </div>
 
               <div className="creation-summary">
                 <div><span>项目</span><strong>{draft.name}</strong><small>{draft.code} · {draft.secrecy}</small></div>
-                <div><span>输出模板</span><strong>{draft.template}</strong><small>{draft.model}</small></div>
-                <div><span>初始团队</span><strong>{1 + draft.writers.length + 1} 人</strong><small>{draft.owner} 负责 · {draft.reviewer} 审核</small></div>
+                <div><span>输出模板</span><strong>{source === 'api' ? '待后续配置' : draft.template}</strong><small>{source === 'api' ? '本阶段不保存模板与模型' : draft.model}</small></div>
+                <div><span>初始团队</span><strong>{source === 'api' ? (draft.owner || '待选择负责人') : `${1 + draft.writers.length + 1} 人`}</strong><small>{source === 'api' ? '当前仅保存项目负责人' : `${draft.owner} 负责 · ${draft.reviewer} 审核`}</small></div>
               </div>
               </div>
             </>
@@ -286,7 +415,7 @@ export function NewProjectPage() {
               {step > 0 ? <Button variant="secondary" icon={<ChevronLeft size={16} />} onClick={() => setStep((current) => current - 1)}>上一步</Button> : null}
               {step < 2
                 ? <Button icon={<ChevronRight size={16} />} onClick={nextStep}>下一步</Button>
-                : <Button icon={<FileUp size={16} />} onClick={requestCreate}>创建并上传</Button>}
+                : <Button icon={<FileUp size={16} />} disabled={creating} onClick={requestCreate}>创建并上传</Button>}
             </div>
           </footer>
         </section>
@@ -296,11 +425,12 @@ export function NewProjectPage() {
         open={confirmOpen}
         title="确认创建项目"
         description="创建后将建立项目空间，并进入招标文件上传流程。"
-        onClose={() => setConfirmOpen(false)}
+        closeDisabled={creating}
+        onClose={() => { if (!creating) setConfirmOpen(false) }}
         footer={(
           <>
-            <Button variant="secondary" onClick={() => setConfirmOpen(false)}>返回检查</Button>
-            <Button icon={<FileUp size={16} />} onClick={confirmCreate}>确认并上传文件</Button>
+            <Button variant="secondary" disabled={creating} onClick={() => setConfirmOpen(false)}>返回检查</Button>
+            <Button icon={<FileUp size={16} />} disabled={creating} onClick={confirmCreate}>{creating ? '正在创建…' : '确认并上传文件'}</Button>
           </>
         )}
       >
@@ -308,6 +438,11 @@ export function NewProjectPage() {
           <span className="confirm-object-icon"><ShieldCheck size={22} /></span>
           <div><strong>{draft.name}</strong><p>{draft.code} · 截止时间 {draft.deadline.replace('T', ' ')}</p></div>
         </div>
+        {creationFailure ? (
+          <InlineMessage tone="error" title="项目创建失败">
+            {creationFailure.detail}{creationFailure.requestId ? ` 请求编号：${creationFailure.requestId}` : ''}
+          </InlineMessage>
+        ) : null}
         <InlineMessage tone="warning" title="AI 结果需人工确认">
           文件解析和正文生成默认均为候选结果，不会自动成为已批准内容。
         </InlineMessage>

@@ -90,7 +90,7 @@ export interface RequirementSourceLocator {
   kind: 'development-fixture'
   fileId: string
   fileName: string
-  pageNumber: null
+  pageNumber: number | null
   sectionPath: string[]
   paragraphIndex: null
   quote: string

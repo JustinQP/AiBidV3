@@ -72,6 +72,8 @@ input, textarea, select { color: var(--text); }
 .project-sidebar nav a { position: relative; display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 10px; color: #4d5968; border-radius: 7px; font-size: 13px; }
 .project-sidebar nav a:hover { background: #f6f8fa; color: var(--text); }
 .project-sidebar nav a.active { color: var(--primary); background: var(--primary-soft); font-weight: 600; }
+.project-sidebar nav a[aria-disabled="true"] { opacity: .48; cursor: not-allowed; }
+.project-sidebar nav a[aria-disabled="true"]:hover { color: #4d5968; background: transparent; }
 .project-sidebar nav a.active::before { content: ""; position: absolute; left: -10px; width: 3px; height: 26px; background: var(--primary); border-radius: 0 3px 3px 0; }
 .project-collapse { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: auto; min-height: 44px; color: var(--text-3); border-top: 1px solid var(--border-soft); font-size: 12px; }
 

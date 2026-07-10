@@ -58,6 +58,23 @@ describe('AiBid API', () => {
     expect(response.json()).toMatchObject({ data: { status: 'ok', repository: 'memory' } })
   })
 
+  it('allows browser preflight for requirement confirmation requests', async () => {
+    const response = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/v1/projects/project-1/requirements/requirement-1/confirmation',
+      headers: {
+        origin: 'http://localhost:4173',
+        'access-control-request-method': 'PATCH',
+        'access-control-request-headers': 'content-type,x-tenant-id',
+      },
+    })
+
+    expect(response.statusCode).toBe(204)
+    expect(response.headers['access-control-allow-origin']).toBe('http://localhost:4173')
+    expect(response.headers['access-control-allow-methods']).toContain('PATCH')
+    expect(response.headers['access-control-allow-headers']).toContain('x-tenant-id')
+  })
+
   it('isolates project reads by tenant and returns RFC 7807 errors', async () => {
     const project = await createProject(app, 'tenant-a', '医院信息化项目')
 

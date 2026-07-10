@@ -15,7 +15,7 @@ export interface BidFile {
 }
 
 export type RequirementType = '评分项' | '技术要求' | '资格项' | '商务要求' | '无效条款'
-export type RequirementStatus = '未确认' | '待响应' | '编写中' | '已响应' | '已确认'
+export type RequirementStatus = '未确认' | '待响应' | '编写中' | '已响应' | '已确认' | '已驳回'
 export type RiskLevel = '阻断' | '高' | '中' | '低'
 
 export interface Requirement {
