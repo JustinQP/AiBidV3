@@ -21,6 +21,12 @@
 
 原型使用本地 Mock 数据和 `localStorage` 保存演示状态，不依赖真实后端。DOCX 下载用于演示交互，正式文档渲染能力需在后续研发阶段接入。
 
+> **上传口径说明**：原型界面展示的是目标产品能力（含更宽的文件格式与 200 MB 级上限）；当前第一阶段 API 仅接受 PDF、DOC、DOCX、TXT，默认上限 25 MiB，而且尚未接入这些页面。演示 UI 提示不能视为后端已实现的能力。
+
+默认数据源仍为 `mock`，因此后端未启动时全部演示交互保持可用。`src/api/` 已提供项目、文件上传、异步任务和要求项的类型安全 HTTP client，供纵向切片逐页接入真实接口。
+
+当前原型上传界面展示的是目标产品范围（包括 XLS/XLSX/ZIP 和 200 MB 上限）；第一阶段 API 尚未接入这些页面，只接受 PDF/DOC/DOCX/TXT，默认上限为 25 MiB。接入真实页面时必须以后端能力与 OpenAPI 契约为准。
+
 ## 技术栈
 
 - React + TypeScript + Vite
@@ -37,6 +43,19 @@ npm run dev
 ```
 
 默认地址：`http://localhost:4173`
+
+如需联调后端，先复制环境变量示例并按本机端口调整：
+
+```bash
+cp .env.example .env.local
+```
+
+- `VITE_DATA_SOURCE=mock`：默认值，继续使用本地原型数据。
+- `VITE_DATA_SOURCE=api`：为后续真实数据适配层预留；当前页面不会仅因切换该变量而自动改写数据。
+- `VITE_API_BASE_URL`：业务 API 根路径，默认约定为 `http://localhost:3000/api/v1`。
+- `VITE_API_HEALTH_URL`：不带 `/api/v1` 的健康检查端点。
+- `VITE_API_TIMEOUT_MS`：请求超时毫秒数。
+- `VITE_API_TENANT_ID`：仅用于本地开发的租户上下文请求头，不等同于生产鉴权。
 
 工程检查：
 

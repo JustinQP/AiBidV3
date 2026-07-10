@@ -1,0 +1,780 @@
+openapi: 3.1.0
+info:
+  title: AiBidV3 API
+  version: 0.1.0
+  summary: AI 投标书 MVP 纵向切片 API
+  description: |
+    AiBidV3 第一阶段开发契约，覆盖项目、文件上传、开发解析任务、
+    提取要求和人工确认。
+
+    JSON 字段使用 camelCase。成功响应统一包裹在 `data` 中；错误响应
+    使用 RFC 7807 `application/problem+json`。
+
+    当前实现使用 `DEV_TENANT_ID` 或可选 `x-tenant-id` 请求头注入本地租户
+    上下文，仅用于开发联调，不代表生产认证方案。生产环境必须从已验证的
+    身份令牌生成租户上下文，并移除开发请求头覆盖能力。
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://localhost:3000
+    description: 本地开发 API
+# The first-stage server is intentionally unauthenticated and injects a
+# development tenant context. Production authentication will replace this.
+security: []
+tags:
+  - name: Health
+    description: 运行状态
+  - name: Projects
+    description: 投标项目
+  - name: Files
+    description: 招标文件上传与状态
+  - name: Tasks
+    description: 解析任务
+  - name: Requirements
+    description: 提取要求与人工确认
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: 检查 API 存活状态
+      responses:
+        "200":
+          description: API 正常运行
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/projects:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: 查询当前租户的项目
+      responses:
+        "200":
+          description: 项目列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Project"
+        default:
+          $ref: "#/components/responses/Problem"
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: 创建投标项目
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectInput"
+      responses:
+        "201":
+          description: 项目已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "409":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: 获取项目详情
+      responses:
+        "200":
+          description: 项目详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Project"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/projects/{projectId}/files:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Files]
+      operationId: listProjectFiles
+      summary: 查询项目文件
+      responses:
+        "200":
+          description: 文件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProjectFile"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+    post:
+      tags: [Files]
+      operationId: uploadProjectFile
+      summary: 上传文件并创建开发解析任务
+      description: |
+        接收名为 `file` 的 multipart 文件。文件与任务记录持久化成功后立即
+        返回 `202 Accepted`；解析结果通过任务资源轮询，不在本请求中返回。
+
+        第一阶段解析结果来自明确标注的开发适配器，不是对原文件内容的真实解析。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 招标文件；默认上限 25 MiB，可由服务端配置调整
+            encoding:
+              file:
+                contentType: application/pdf, application/msword, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain
+      responses:
+        "202":
+          description: 文件已接收，解析任务已排队
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadAcceptedResponse"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "413":
+          $ref: "#/components/responses/Problem"
+        "415":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/projects/{projectId}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Tasks]
+      operationId: listProjectTasks
+      summary: 查询项目解析任务
+      responses:
+        "200":
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ParseTask"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/tasks/{taskId}:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: 获取解析任务状态
+      responses:
+        "200":
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ParseTask"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/tasks/{taskId}/retry:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/TaskId"
+    post:
+      tags: [Tasks]
+      operationId: retryTask
+      summary: 重试失败的解析任务
+      description: |
+        仅 `failed` 任务可重试。服务端把同一任务恢复为 `queued` 并再次交给
+        开发解析适配器；其他状态返回 `TASK_NOT_RETRYABLE`。
+      responses:
+        "202":
+          description: 任务已重新排队
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/ParseTask"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/projects/{projectId}/requirements:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [Requirements]
+      operationId: listProjectRequirements
+      summary: 查询项目提取要求
+      parameters:
+        - name: confirmationStatus
+          in: query
+          description: 按人工确认状态过滤
+          schema:
+            $ref: "#/components/schemas/ConfirmationStatus"
+        - name: priority
+          in: query
+          description: 按优先级过滤
+          schema:
+            $ref: "#/components/schemas/RequirementPriority"
+      responses:
+        "200":
+          description: 要求列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Requirement"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /api/v1/projects/{projectId}/requirements/{requirementId}/confirmation:
+    parameters:
+      - $ref: "#/components/parameters/DevTenantId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/RequirementId"
+    patch:
+      tags: [Requirements]
+      operationId: updateRequirementConfirmation
+      summary: 确认或驳回提取要求
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RequirementConfirmationInput"
+      responses:
+        "200":
+          description: 已更新的要求
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Requirement"
+        "400":
+          $ref: "#/components/responses/Problem"
+        "404":
+          $ref: "#/components/responses/Problem"
+        "409":
+          $ref: "#/components/responses/Problem"
+        default:
+          $ref: "#/components/responses/Problem"
+
+components:
+  parameters:
+    DevTenantId:
+      name: x-tenant-id
+      in: header
+      required: false
+      description: |
+        仅开发环境可用的租户覆盖值；省略时使用服务端 `DEV_TENANT_ID`。
+        此请求头不是认证机制，生产环境必须禁用。
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z0-9_-]+$"
+        examples: [tenant-demo]
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      description: 项目 ULID
+      schema:
+        $ref: "#/components/schemas/ResourceId"
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      description: 任务 ULID
+      schema:
+        $ref: "#/components/schemas/ResourceId"
+    RequirementId:
+      name: requirementId
+      in: path
+      required: true
+      description: 要求 ULID
+      schema:
+        $ref: "#/components/schemas/ResourceId"
+
+  responses:
+    Problem:
+      description: RFC 7807 错误
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    ResourceId:
+      type: string
+      minLength: 26
+      maxLength: 26
+      pattern: "^[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["01JZ7Y6N2ZQ6N3F1J9YK0N3B8A"]
+
+    Timestamp:
+      type: string
+      format: date-time
+      examples: ["2026-07-10T18:30:00.000Z"]
+
+    HealthResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [status, repository, timestamp]
+          properties:
+            status:
+              type: string
+              const: ok
+            repository:
+              type: string
+              enum: [memory, postgres]
+            timestamp:
+              $ref: "#/components/schemas/Timestamp"
+
+    ProjectStatus:
+      type: string
+      enum: [draft, active, archived]
+
+    Project:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - code
+        - customerName
+        - ownerName
+        - deadline
+        - status
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ResourceId"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+        code:
+          type: [string, "null"]
+          maxLength: 80
+        customerName:
+          type: [string, "null"]
+          maxLength: 160
+        ownerName:
+          type: [string, "null"]
+          maxLength: 160
+        deadline:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+        status:
+          $ref: "#/components/schemas/ProjectStatus"
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+        updatedAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    CreateProjectInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+          examples: ["智慧园区综合服务投标项目"]
+        code:
+          type: [string, "null"]
+          maxLength: 80
+          examples: ["BID-2026-001"]
+        customerName:
+          type: [string, "null"]
+          maxLength: 160
+          examples: ["示例客户"]
+        ownerName:
+          type: [string, "null"]
+          maxLength: 160
+          examples: ["项目负责人"]
+        deadline:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+
+    FileParseStatus:
+      type: string
+      enum: [queued, parsing, parsed, failed]
+
+    ProjectFile:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - projectId
+        - fileName
+        - mediaType
+        - sizeBytes
+        - sha256
+        - parseStatus
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ResourceId"
+        projectId:
+          $ref: "#/components/schemas/ResourceId"
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        mediaType:
+          type: string
+          minLength: 1
+          maxLength: 255
+        sizeBytes:
+          type: integer
+          minimum: 1
+          description: 服务端默认限制为 25 MiB，可由部署配置收紧或调整
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        parseStatus:
+          $ref: "#/components/schemas/FileParseStatus"
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+        updatedAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    TaskStatus:
+      type: string
+      enum: [queued, running, succeeded, failed]
+
+    TaskError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 100
+        message:
+          type: string
+          minLength: 1
+          maxLength: 1000
+
+    ParseTask:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - projectId
+        - fileId
+        - type
+        - status
+        - progress
+        - error
+        - createdAt
+        - startedAt
+        - finishedAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ResourceId"
+        projectId:
+          $ref: "#/components/schemas/ResourceId"
+        fileId:
+          $ref: "#/components/schemas/ResourceId"
+        type:
+          type: string
+          const: development-document-parse
+          description: 第一阶段开发适配器任务类型；真实 worker 接入时将版本化扩展
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/TaskError"
+            - type: "null"
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+        startedAt:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+        finishedAt:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+        updatedAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    RequirementCategory:
+      type: string
+      enum: [technical, commercial, compliance]
+
+    RequirementPriority:
+      type: string
+      enum: [mandatory, important, normal]
+
+    ConfirmationStatus:
+      type: string
+      enum: [pending, confirmed, rejected]
+
+    DevelopmentSourceLocator:
+      type: object
+      additionalProperties: false
+      description: |
+        第一阶段开发定位器。`kind=development-fixture` 明确表示内容不是从原文件
+        真实定位所得，客户端不得把它渲染为已验证的原文引用。
+      required:
+        - kind
+        - fileId
+        - fileName
+        - pageNumber
+        - sectionPath
+        - paragraphIndex
+        - quote
+      properties:
+        kind:
+          type: string
+          const: development-fixture
+        fileId:
+          $ref: "#/components/schemas/ResourceId"
+        fileName:
+          type: string
+        pageNumber:
+          type: "null"
+        sectionPath:
+          type: array
+          items:
+            type: string
+        paragraphIndex:
+          type: "null"
+        quote:
+          type: string
+
+    Requirement:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - projectId
+        - fileId
+        - taskId
+        - code
+        - title
+        - description
+        - category
+        - priority
+        - confirmationStatus
+        - confirmationNote
+        - confirmedAt
+        - extractionMethod
+        - sourceLocator
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ResourceId"
+        projectId:
+          $ref: "#/components/schemas/ResourceId"
+        fileId:
+          $ref: "#/components/schemas/ResourceId"
+        taskId:
+          $ref: "#/components/schemas/ResourceId"
+        code:
+          type: string
+          minLength: 1
+          maxLength: 100
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description:
+          type: string
+          minLength: 1
+        category:
+          $ref: "#/components/schemas/RequirementCategory"
+        priority:
+          $ref: "#/components/schemas/RequirementPriority"
+        confirmationStatus:
+          $ref: "#/components/schemas/ConfirmationStatus"
+        confirmationNote:
+          type: [string, "null"]
+          maxLength: 1000
+        confirmedAt:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+        extractionMethod:
+          type: string
+          const: development-fixture
+        sourceLocator:
+          $ref: "#/components/schemas/DevelopmentSourceLocator"
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+        updatedAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    RequirementConfirmationInput:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [confirmed, rejected]
+        note:
+          type: [string, "null"]
+          maxLength: 1000
+
+    UploadAcceptedResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [file, task]
+          properties:
+            file:
+              $ref: "#/components/schemas/ProjectFile"
+            task:
+              $ref: "#/components/schemas/ParseTask"
+
+    InvalidParameter:
+      type: object
+      additionalProperties: false
+      required: [name, reason]
+      properties:
+        name:
+          type: string
+        reason:
+          type: string
+
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details；扩展字段用于稳定机器处理和请求关联
+      required: [type, title, status, detail, instance, requestId, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          examples: ["https://aibid.example/problems/validation-error"]
+        title:
+          type: string
+          examples: ["请求参数无效"]
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+          examples: ["请检查请求字段后重试。"]
+        instance:
+          type: string
+          format: uri-reference
+          examples: ["/api/v1/projects"]
+        requestId:
+          type: string
+          examples: ["req-01JZ7Y6N2ZQ6N3F1J9YK0N3B8A"]
+        code:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]*$"
+          examples: ["VALIDATION_ERROR"]
+        invalidParams:
+          type: array
+          items:
+            $ref: "#/components/schemas/InvalidParameter"
+      additionalProperties: true
