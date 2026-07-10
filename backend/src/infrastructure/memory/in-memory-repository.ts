@@ -7,11 +7,11 @@ import type {
   Requirement,
   RequirementConfirmation,
   RequirementFilters,
-  StoredProjectFile,
+  StoredProjectFileRecord,
 } from '../../domain/models.js'
 import type { BidRepository } from '../../domain/repository.js'
 
-function publicFile(file: StoredProjectFile): ProjectFile {
+function publicFile(file: ProjectFile): ProjectFile {
   return {
     id: file.id,
     tenantId: file.tenantId,
@@ -28,7 +28,7 @@ function publicFile(file: StoredProjectFile): ProjectFile {
 
 export class InMemoryBidRepository implements BidRepository {
   private readonly projects = new Map<string, Project>()
-  private readonly files = new Map<string, StoredProjectFile>()
+  private readonly files = new Map<string, StoredProjectFileRecord>()
   private readonly tasks = new Map<string, ParseTask>()
   private readonly requirements = new Map<string, Requirement>()
 
@@ -66,7 +66,11 @@ export class InMemoryBidRepository implements BidRepository {
     if (project?.tenantId !== upload.file.tenantId || upload.task.tenantId !== upload.file.tenantId) {
       throw new Error('Cannot create an upload outside its tenant and project boundary')
     }
-    this.files.set(upload.file.id, { ...upload.file, content: Buffer.from(upload.file.content) })
+    const { objectReference, ...file } = upload.file
+    this.files.set(upload.file.id, {
+      ...file,
+      source: { kind: 'object', reference: { ...objectReference } },
+    })
     this.tasks.set(upload.task.id, { ...upload.task })
     return { file: publicFile(upload.file), task: { ...upload.task } }
   }
@@ -78,10 +82,16 @@ export class InMemoryBidRepository implements BidRepository {
       .map(publicFile)
   }
 
-  async findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFile | null> {
+  async findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFileRecord | null> {
     const file = this.files.get(fileId)
     if (file?.tenantId !== tenantId) return null
-    return { ...file, content: Buffer.from(file.content) }
+    return {
+      ...file,
+      source:
+        file.source.kind === 'object'
+          ? { kind: 'object', reference: { ...file.source.reference } }
+          : { kind: 'legacy-inline', content: Buffer.from(file.source.content) },
+    }
   }
 
   async listProjectTasks(tenantId: string, projectId: string): Promise<ParseTask[]> {

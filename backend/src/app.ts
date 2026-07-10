@@ -3,33 +3,46 @@ import multipart from '@fastify/multipart'
 import Fastify from 'fastify'
 import type { FastifyError } from 'fastify'
 import { DevelopmentDocumentParser } from './application/development-document-parser.js'
+import { FileContentLoader } from './application/file-content-loader.js'
+import { UploadIngestionService } from './application/upload-ingestion-service.js'
 import { UploadProcessingService } from './application/upload-processing-service.js'
 import { registerRoutes } from './api/routes.js'
 import { loadConfig } from './config.js'
 import type { AppConfig } from './config.js'
+import type { ObjectStorage } from './domain/object-storage.js'
 import type { BidRepository } from './domain/repository.js'
+import { createObjectStorage } from './infrastructure/object-storage-factory.js'
 import { createRepository } from './infrastructure/repository-factory.js'
-import { AppError } from './lib/app-error.js'
+import { AppError, dependencyErrorDiagnostic } from './lib/app-error.js'
 
 export interface BuildAppOptions {
   config?: AppConfig
   repository?: BidRepository
+  objectStorage?: ObjectStorage
   enableLogger?: boolean
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
   const config = options.config ?? loadConfig()
   const repository = options.repository ?? (await createRepository(config))
+  const objectStorage = options.objectStorage ?? createObjectStorage(config)
   const app = Fastify({
     logger: options.enableLogger ? { level: config.logLevel } : false,
     bodyLimit: 1024 * 1024,
   })
   const processor = new UploadProcessingService(
     repository,
+    new FileContentLoader(repository, objectStorage),
     new DevelopmentDocumentParser(),
     config.devParserDelayMs,
     (error, context) => app.log.error({ err: error, ...context }, 'development parser task failed'),
   )
+  const ingestion = new UploadIngestionService(repository, objectStorage, (error, context) => {
+    app.log.error(
+      { dependencyError: dependencyErrorDiagnostic(error), ...context },
+      'upload ingestion recovery requires attention',
+    )
+  })
   const recoveredTasks = await repository.recoverPendingTasks()
   for (const task of recoveredTasks) {
     processor.enqueue(task.tenantId, task.id)
@@ -74,7 +87,7 @@ export async function buildApp(options: BuildAppOptions = {}) {
         : status < 500
           ? 'Request Rejected'
           : 'Internal Server Error'
-    const detail = status < 500 ? error.message : 'An unexpected error occurred'
+    const detail = isKnown || status < 500 ? error.message : 'An unexpected error occurred'
     if (status >= 500) request.log.error({ err: error }, 'request failed')
     return reply.type('application/problem+json').code(status).send({
       type: `https://aibid.dev/problems/${code.toLowerCase().replaceAll('_', '-')}`,
@@ -87,10 +100,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
     })
   })
 
-  await registerRoutes(app, { config, repository, processor })
+  await registerRoutes(app, { config, repository, ingestion, processor })
   app.addHook('onClose', async () => {
     await processor.waitForIdle()
-    await repository.close()
+    try {
+      await repository.close()
+    } finally {
+      await objectStorage.close()
+    }
   })
   return app
 }

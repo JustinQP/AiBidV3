@@ -5,7 +5,8 @@ import type { AppConfig } from '../config.js'
 import type {
   ConfirmationStatus,
   NewProject,
-  NewUpload,
+  ParseTask,
+  ProjectFile,
   ProjectStatus,
   RequirementFilters,
   RequirementPriority,
@@ -14,12 +15,14 @@ import type { BidRepository } from '../domain/repository.js'
 import { badRequest, notFound, payloadTooLarge, unsupportedMediaType } from '../lib/app-error.js'
 import { createId } from '../lib/id.js'
 import type { UploadProcessingService } from '../application/upload-processing-service.js'
+import type { UploadIngestionService } from '../application/upload-ingestion-service.js'
 import { presentFile, presentProject, presentRequirement, presentTask } from './presenters.js'
 import { getTenantId } from './tenant-context.js'
 
 interface RouteDependencies {
   config: AppConfig
   repository: BidRepository
+  ingestion: UploadIngestionService
   processor: UploadProcessingService
 }
 
@@ -115,10 +118,10 @@ export async function registerRoutes(
   app: FastifyInstance,
   dependencies: RouteDependencies,
 ): Promise<void> {
-  const { config, repository, processor } = dependencies
+  const { config, repository, ingestion, processor } = dependencies
 
   app.get('/health', async () => {
-    await repository.ping()
+    await Promise.all([repository.ping(), ingestion.ping()])
     return {
       data: {
         status: 'ok',
@@ -201,36 +204,33 @@ export async function registerRoutes(
     const now = new Date().toISOString()
     const fileId = createId()
     const taskId = createId()
-    const upload: NewUpload = {
-      file: {
-        id: fileId,
-        tenantId,
-        projectId,
-        fileName,
-        mediaType: part.mimetype || 'application/octet-stream',
-        sizeBytes: content.length,
-        sha256: createHash('sha256').update(content).digest('hex'),
-        content,
-        parseStatus: 'queued',
-        createdAt: now,
-        updatedAt: now,
-      },
-      task: {
-        id: taskId,
-        tenantId,
-        projectId,
-        fileId,
-        type: 'development-document-parse',
-        status: 'queued',
-        progress: 0,
-        error: null,
-        createdAt: now,
-        startedAt: null,
-        finishedAt: null,
-        updatedAt: now,
-      },
+    const file: ProjectFile = {
+      id: fileId,
+      tenantId,
+      projectId,
+      fileName,
+      mediaType: part.mimetype || 'application/octet-stream',
+      sizeBytes: content.length,
+      sha256: createHash('sha256').update(content).digest('hex'),
+      parseStatus: 'queued',
+      createdAt: now,
+      updatedAt: now,
     }
-    const created = await repository.createUpload(upload)
+    const task: ParseTask = {
+      id: taskId,
+      tenantId,
+      projectId,
+      fileId,
+      type: 'development-document-parse',
+      status: 'queued',
+      progress: 0,
+      error: null,
+      createdAt: now,
+      startedAt: null,
+      finishedAt: null,
+      updatedAt: now,
+    }
+    const created = await ingestion.ingest({ file, task, content })
     processor.enqueue(tenantId, taskId)
     return reply.code(202).send({
       data: { file: presentFile(created.file), task: presentTask(created.task) },

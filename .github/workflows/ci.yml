@@ -69,8 +69,17 @@ jobs:
       run:
         working-directory: backend
     env:
+      REPOSITORY_DRIVER: postgres
       DATABASE_URL: postgresql://aibid:aibid_test@localhost:5432/aibid_test
       DATABASE_SSL: "false"
+      OBJECT_STORAGE_DRIVER: s3
+      OBJECT_STORAGE_TIMEOUT_MS: "10000"
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: aibid-test
+      S3_ACCESS_KEY: aibid-ci
+      S3_SECRET_KEY: aibid-ci-secret
+      S3_FORCE_PATH_STYLE: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -85,13 +94,25 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Start and initialize MinIO
+        working-directory: ${{ github.workspace }}
+        env:
+          MINIO_ROOT_USER: aibid-ci
+          MINIO_ROOT_PASSWORD: aibid-ci-secret
+          S3_BUCKET: aibid-test
+          MINIO_API_PORT: 9000
+          MINIO_CONSOLE_PORT: 9001
+        run: |
+          docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up -d --wait minio
+          docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up --no-deps minio-init
+
       - name: Run backend checks
         run: npm run check
 
       - name: Apply PostgreSQL migrations
         run: npm run db:migrate
 
-      - name: Run PostgreSQL repository smoke test
+      - name: Run persistence smoke test
         run: npm run db:smoke
 
   contracts:

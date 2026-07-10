@@ -1,3 +1,5 @@
+import type { ObjectReference } from './object-storage.js'
+
 export type ProjectStatus = 'draft' | 'active' | 'archived'
 export type FileParseStatus = 'queued' | 'parsing' | 'parsed' | 'failed'
 export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed'
@@ -33,6 +35,18 @@ export interface ProjectFile {
 
 export interface StoredProjectFile extends ProjectFile {
   content: Buffer
+}
+
+export interface NewStoredProjectFile extends ProjectFile {
+  objectReference: ObjectReference
+}
+
+export type StoredProjectFileSource =
+  | { kind: 'object'; reference: ObjectReference }
+  | { kind: 'legacy-inline'; content: Buffer }
+
+export interface StoredProjectFileRecord extends ProjectFile {
+  source: StoredProjectFileSource
 }
 
 export interface TaskError {
@@ -104,7 +118,7 @@ export interface NewProject {
 }
 
 export interface NewUpload {
-  file: StoredProjectFile
+  file: NewStoredProjectFile
   task: ParseTask
 }
 

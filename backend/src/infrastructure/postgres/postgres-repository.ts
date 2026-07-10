@@ -14,11 +14,12 @@ import type {
   RequirementConfirmation,
   RequirementFilters,
   RequirementPriority,
-  StoredProjectFile,
+  StoredProjectFileRecord,
   TaskError,
   TaskStatus,
 } from '../../domain/models.js'
 import type { BidRepository } from '../../domain/repository.js'
+import { isOriginalObjectKeyWithinBoundary } from '../../domain/object-storage.js'
 
 interface ProjectRow extends QueryResultRow {
   id: string
@@ -41,7 +42,11 @@ interface FileRow extends QueryResultRow {
   media_type: string
   size_bytes: string | number
   sha256: string
-  content?: Buffer
+  content?: Buffer | null
+  object_key: string | null
+  object_version_id: string | null
+  object_etag: string | null
+  object_stored_at: Date | string | null
   parse_status: FileParseStatus
   created_at: Date | string
   updated_at: Date | string
@@ -243,8 +248,9 @@ export class PostgresBidRepository implements BidRepository {
       const fileResult = await client.query<FileRow>(
         `INSERT INTO project_files (
           id, tenant_id, project_id, file_name, media_type, size_bytes, sha256, content,
+          object_key, object_version_id, object_etag, object_stored_at,
           parse_status, created_at, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,$10,$11,$12,$13,$14)
         RETURNING *`,
         [
           upload.file.id,
@@ -254,7 +260,10 @@ export class PostgresBidRepository implements BidRepository {
           upload.file.mediaType,
           upload.file.sizeBytes,
           upload.file.sha256,
-          upload.file.content,
+          upload.file.objectReference.key,
+          upload.file.objectReference.versionId,
+          upload.file.objectReference.etag,
+          upload.file.createdAt,
           upload.file.parseStatus,
           upload.file.createdAt,
           upload.file.updatedAt,
@@ -297,14 +306,37 @@ export class PostgresBidRepository implements BidRepository {
     return result.rows.map(mapFile)
   }
 
-  async findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFile | null> {
+  async findStoredFile(tenantId: string, fileId: string): Promise<StoredProjectFileRecord | null> {
     const result = await this.pool.query<FileRow>(
       'SELECT * FROM project_files WHERE tenant_id = $1 AND id = $2',
       [tenantId, fileId],
     )
     const row = result.rows[0]
-    if (!row?.content) return null
-    return { ...mapFile(row), content: row.content }
+    if (!row) return null
+    const file = mapFile(row)
+    if (row.object_key) {
+      if (!isOriginalObjectKeyWithinBoundary(row.object_key, file)) {
+        throw new Error('Stored object key did not match its tenant, project, and file boundary')
+      }
+      return {
+        ...file,
+        source: {
+          kind: 'object',
+          reference: {
+            key: row.object_key,
+            versionId: row.object_version_id,
+            etag: row.object_etag,
+          },
+        },
+      }
+    }
+    if (row.content) {
+      return {
+        ...file,
+        source: { kind: 'legacy-inline', content: Buffer.from(row.content) },
+      }
+    }
+    return null
   }
 
   async listProjectTasks(tenantId: string, projectId: string): Promise<ParseTask[]> {
