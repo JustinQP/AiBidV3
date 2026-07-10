@@ -83,6 +83,15 @@ export function OverviewPage() {
         )}
       />
 
+      <section className="project-stage-rail" aria-label="投标编制阶段">
+        <button className="completed" onClick={() => navigate('/projects/demo/files')}><span><CheckCircle2 size={16} /></span><div><strong>文件导入</strong><small>{metrics.readyFiles}/{files.length} 可用</small></div></button>
+        <button className="completed" onClick={() => navigate('/projects/demo/analysis')}><span><CheckCircle2 size={16} /></span><div><strong>智能解析</strong><small>{metrics.confirmed}/{requirements.length} 已确认</small></div></button>
+        <button className="completed" onClick={() => navigate('/projects/demo/requirements')}><span><CheckCircle2 size={16} /></span><div><strong>要求确认</strong><small>{metrics.mapped} 项已映射</small></div></button>
+        <button className="active" onClick={() => navigate('/projects/demo/outline')}><span>4</span><div><strong>目录规划</strong><small>待冻结基线</small></div></button>
+        <button className="active current" onClick={() => navigate('/projects/demo/write/s32')}><span>5</span><div><strong>协同写作</strong><small>当前阶段</small></div></button>
+        <button className={sectionApproved ? 'completed' : 'pending'} onClick={() => navigate('/projects/demo/review')}><span>{sectionApproved ? <CheckCircle2 size={16} /> : '6'}</span><div><strong>审核导出</strong><small>{sectionApproved ? '关键章节已批准' : '尚未完成'}</small></div></button>
+      </section>
+
       <section className="project-status-strip">
         <div><span>当前阶段</span><StatusBadge status={stage} /></div>
         <div><span>项目负责人</span><strong><i className="avatar avatar-soft">张</i>{project.owner}</strong></div>
