@@ -62,11 +62,33 @@ export interface ParseTask {
   type: 'development-document-parse'
   status: TaskStatus
   progress: number
+  attempt: number
   error: TaskError | null
   createdAt: string
   startedAt: string | null
   finishedAt: string | null
   updatedAt: string
+}
+
+export interface TaskLease {
+  tenantId: string
+  taskId: string
+  workerId: string
+  token: string
+  expiresAt: string
+}
+
+export interface ClaimedTask {
+  task: ParseTask
+  lease: TaskLease
+}
+
+export interface TaskOutboxEvent {
+  id: string
+  tenantId: string
+  taskId: string
+  publishAttempts: number
+  createdAt: string
 }
 
 export interface DevelopmentSourceLocator {

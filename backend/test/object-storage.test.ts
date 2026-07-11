@@ -11,7 +11,9 @@ import {
   ObjectStorageSizeLimitError,
   originalObjectKey,
 } from '../src/domain/object-storage.js'
-import { loadConfig } from '../src/config.js'
+import { loadApiConfig, loadConfig } from '../src/config.js'
+import { FileContentLoader } from '../src/application/file-content-loader.js'
+import type { BidRepository } from '../src/domain/repository.js'
 import { createObjectStorage } from '../src/infrastructure/object-storage-factory.js'
 import { InMemoryObjectStorage } from '../src/infrastructure/memory/in-memory-object-storage.js'
 import {
@@ -270,5 +272,76 @@ describe('object storage configuration', () => {
     expect(() => loadConfig({ S3_FORCE_PATH_STYLE: 'sometimes' })).toThrow(
       'S3_FORCE_PATH_STYLE must be a boolean',
     )
+    expect(() => loadConfig({ REDIS_URL: 'https://redis.example.test' })).toThrow(
+      'REDIS_URL must be a valid redis:// or rediss:// URL',
+    )
+    expect(() => loadConfig({ TASK_LEASE_MS: '1000', TASK_HEARTBEAT_MS: '1000' })).toThrow(
+      'TASK_HEARTBEAT_MS must be less than TASK_LEASE_MS',
+    )
+    expect(() => loadConfig({ TASK_LEASE_MS: '60000', REDIS_CLAIM_IDLE_MS: '30000' })).toThrow(
+      'REDIS_CLAIM_IDLE_MS must be greater than or equal to TASK_LEASE_MS',
+    )
+  })
+
+  it('loads durable worker and Redis Streams settings without requiring them for the API', () => {
+    const defaults = loadConfig({})
+    expect(defaults).toMatchObject({
+      redisUrl: null,
+      redisStreamKey: 'aibid:parse-tasks',
+      redisConsumerGroup: 'aibid-parser',
+      workerConcurrency: 2,
+      taskLeaseMs: 30_000,
+      taskHeartbeatMs: 10_000,
+      taskMaxAttempts: 3,
+      outboxBatchSize: 20,
+    })
+
+    expect(loadConfig({ REDIS_URL: 'rediss://user:secret@redis.example.test:6380/0' })).toMatchObject({
+      redisUrl: 'rediss://user:secret@redis.example.test:6380/0',
+    })
+  })
+
+  it('does not parse worker-only Redis settings when loading API configuration', () => {
+    expect(
+      loadApiConfig({
+        REPOSITORY_DRIVER: 'postgres',
+        OBJECT_STORAGE_DRIVER: 's3',
+        S3_BUCKET: 'aibid-test',
+        REDIS_URL: 'https://not-a-redis-url.example.test',
+        REDIS_STREAM_KEY: '',
+        TASK_LEASE_MS: 'not-a-number',
+        TASK_HEARTBEAT_MS: '999999',
+        TASK_MAX_ATTEMPTS: 'not-a-number',
+        REDIS_CLAIM_IDLE_MS: '1',
+        DEV_PARSER_DELAY_MS: 'not-a-number',
+      }),
+    ).toMatchObject({
+      redisUrl: null,
+      redisStreamKey: 'aibid:parse-tasks',
+      redisConsumerGroup: 'aibid-parser',
+      taskHeartbeatMs: 10_000,
+      taskLeaseMs: 30_000,
+      taskMaxAttempts: 3,
+      redisClaimIdleMs: 60_000,
+      devParserDelayMs: 250,
+    })
+  })
+})
+
+describe('file metadata loading', () => {
+  it('normalizes a repository read outage as a transient dependency error', async () => {
+    const repository = {
+      findStoredFile: async () => {
+        throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' })
+      },
+    } as unknown as BidRepository
+    const storage = new InMemoryObjectStorage()
+    const loader = new FileContentLoader(repository, storage)
+
+    await expect(loader.loadForProcessing('tenant-a', 'file-a')).rejects.toMatchObject({
+      status: 503,
+      code: 'DATABASE_UNAVAILABLE',
+      diagnostic: { code: 'ECONNRESET' },
+    })
   })
 })

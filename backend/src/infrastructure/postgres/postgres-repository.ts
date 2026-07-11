@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto'
 import type { Pool, PoolClient, QueryResultRow } from 'pg'
 import type {
+  ClaimedTask,
   ConfirmationStatus,
   DevelopmentSourceLocator,
   FileParseStatus,
@@ -16,10 +18,14 @@ import type {
   RequirementPriority,
   StoredProjectFileRecord,
   TaskError,
+  TaskLease,
+  TaskOutboxEvent,
   TaskStatus,
 } from '../../domain/models.js'
 import type { BidRepository } from '../../domain/repository.js'
 import { isOriginalObjectKeyWithinBoundary } from '../../domain/object-storage.js'
+import { AppError } from '../../lib/app-error.js'
+import { createId } from '../../lib/id.js'
 
 interface ProjectRow extends QueryResultRow {
   id: string
@@ -60,11 +66,25 @@ interface TaskRow extends QueryResultRow {
   type: 'development-document-parse'
   status: TaskStatus
   progress: number
+  attempt: number
+  next_attempt_at: Date | string
   error: TaskError | null
   created_at: Date | string
   started_at: Date | string | null
   finished_at: Date | string | null
   updated_at: Date | string
+  lease_token: string | null
+  lease_owner: string | null
+  lease_expires_at: Date | string | null
+  dead_lettered_at: Date | string | null
+}
+
+interface OutboxRow extends QueryResultRow {
+  id: string
+  tenant_id: string
+  task_id: string
+  publish_attempts: number
+  created_at: Date | string
 }
 
 interface RequirementRow extends QueryResultRow {
@@ -134,11 +154,22 @@ function mapTask(row: TaskRow): ParseTask {
     type: row.type,
     status: row.status,
     progress: row.progress,
+    attempt: row.attempt,
     error: row.error,
     createdAt: timestamp(row.created_at),
     startedAt: nullableTimestamp(row.started_at),
     finishedAt: nullableTimestamp(row.finished_at),
     updatedAt: timestamp(row.updated_at),
+  }
+}
+
+function mapOutboxEvent(row: OutboxRow): TaskOutboxEvent {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    taskId: row.task_id,
+    publishAttempts: row.publish_attempts,
+    createdAt: timestamp(row.created_at),
   }
 }
 
@@ -173,36 +204,6 @@ export class PostgresBidRepository implements BidRepository {
 
   async close(): Promise<void> {
     await this.pool.end()
-  }
-
-  async recoverPendingTasks(): Promise<ParseTask[]> {
-    return this.withTransaction(async (client) => {
-      const now = new Date().toISOString()
-      await client.query(
-        `UPDATE parse_tasks
-        SET status = 'queued', progress = 0, error = NULL, started_at = NULL,
-          finished_at = NULL, updated_at = $1
-        WHERE status = 'running'`,
-        [now],
-      )
-      await client.query(
-        `UPDATE project_files AS file
-        SET parse_status = 'queued', updated_at = $1
-        WHERE file.parse_status <> 'queued'
-          AND EXISTS (
-            SELECT 1 FROM parse_tasks AS task
-            WHERE task.tenant_id = file.tenant_id
-              AND task.project_id = file.project_id
-              AND task.file_id = file.id
-              AND task.status = 'queued'
-          )`,
-        [now],
-      )
-      const pending = await client.query<TaskRow>(
-        `SELECT * FROM parse_tasks WHERE status = 'queued' ORDER BY created_at`,
-      )
-      return pending.rows.map(mapTask)
-    })
   }
 
   async createProject(project: NewProject): Promise<Project> {
@@ -244,6 +245,20 @@ export class PostgresBidRepository implements BidRepository {
   }
 
   async createUpload(upload: NewUpload): Promise<{ file: ProjectFile; task: ParseTask }> {
+    if (
+      upload.task.tenantId !== upload.file.tenantId ||
+      upload.task.projectId !== upload.file.projectId ||
+      upload.task.fileId !== upload.file.id ||
+      upload.file.parseStatus !== 'queued' ||
+      upload.task.status !== 'queued' ||
+      upload.task.progress !== 0 ||
+      upload.task.attempt !== 0 ||
+      upload.task.error !== null ||
+      upload.task.startedAt !== null ||
+      upload.task.finishedAt !== null
+    ) {
+      throw new Error('Cannot create an upload outside its initial task boundary')
+    }
     return this.withTransaction(async (client) => {
       const fileResult = await client.query<FileRow>(
         `INSERT INTO project_files (
@@ -271,9 +286,9 @@ export class PostgresBidRepository implements BidRepository {
       )
       const taskResult = await client.query<TaskRow>(
         `INSERT INTO parse_tasks (
-          id, tenant_id, project_id, file_id, type, status, progress, error,
+          id, tenant_id, project_id, file_id, type, status, progress, attempt, error,
           created_at, started_at, finished_at, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         RETURNING *`,
         [
           upload.task.id,
@@ -283,12 +298,19 @@ export class PostgresBidRepository implements BidRepository {
           upload.task.type,
           upload.task.status,
           upload.task.progress,
+          upload.task.attempt,
           upload.task.error,
           upload.task.createdAt,
           upload.task.startedAt,
           upload.task.finishedAt,
           upload.task.updatedAt,
         ],
+      )
+      await client.query(
+        `INSERT INTO task_outbox (
+          id, tenant_id, task_id, publish_attempts, available_at, created_at
+        ) VALUES ($1,$2,$3,0,clock_timestamp(),$4)`,
+        [createId(), upload.task.tenantId, upload.task.id, upload.task.createdAt],
       )
       return { file: mapFile(fileResult.rows[0]!), task: mapTask(taskResult.rows[0]!) }
     })
@@ -316,7 +338,12 @@ export class PostgresBidRepository implements BidRepository {
     const file = mapFile(row)
     if (row.object_key) {
       if (!isOriginalObjectKeyWithinBoundary(row.object_key, file)) {
-        throw new Error('Stored object key did not match its tenant, project, and file boundary')
+        throw new AppError(
+          500,
+          'STORED_FILE_INTEGRITY_FAILED',
+          'Stored object key did not match its tenant, project, and file boundary',
+          'Internal Server Error',
+        )
       }
       return {
         ...file,
@@ -355,46 +382,133 @@ export class PostgresBidRepository implements BidRepository {
     return result.rows[0] ? mapTask(result.rows[0]) : null
   }
 
-  async markTaskRunning(tenantId: string, taskId: string, now: string): Promise<ParseTask | null> {
+  async claimTask(
+    tenantId: string,
+    taskId: string,
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+    maxAttempts: number,
+  ): Promise<ClaimedTask | null> {
+    const token = randomUUID()
     return this.withTransaction(async (client) => {
       const taskResult = await client.query<TaskRow>(
         `UPDATE parse_tasks
-        SET status = 'running', progress = 20, started_at = $3, updated_at = $3
-        WHERE tenant_id = $1 AND id = $2 AND status = 'queued'
+        SET status = 'running', progress = 20, attempt = attempt + 1,
+          error = NULL, started_at = $4, finished_at = NULL, updated_at = $4,
+          lease_owner = $3, lease_token = $6,
+          lease_expires_at = clock_timestamp() + ($5::timestamptz - $4::timestamptz),
+          dead_lettered_at = NULL
+        WHERE tenant_id = $1
+          AND id = $2
+          AND dead_lettered_at IS NULL
+          AND attempt < $7::integer
+          AND $7::integer > 0
+          AND $5::timestamptz > $4::timestamptz
+          AND (
+            (status = 'queued' AND next_attempt_at <= clock_timestamp())
+            OR (status = 'running' AND lease_expires_at <= clock_timestamp())
+          )
         RETURNING *`,
-        [tenantId, taskId, now],
+        [tenantId, taskId, workerId, now, leaseExpiresAt, token, maxAttempts],
       )
       const task = taskResult.rows[0]
-      if (!task) return null
+      if (!task) {
+        const exhaustedResult = await client.query<TaskRow>(
+          `UPDATE parse_tasks
+          SET status = 'failed',
+            error = jsonb_build_object(
+              'code', 'TASK_ATTEMPTS_EXHAUSTED',
+              'message', 'Task attempts were exhausted before a worker could complete it'
+            ),
+            finished_at = $3, updated_at = $3, dead_lettered_at = $3,
+            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+          WHERE tenant_id = $1
+            AND id = $2
+            AND dead_lettered_at IS NULL
+            AND attempt >= $4::integer
+            AND $4::integer > 0
+            AND (
+              (status = 'queued' AND next_attempt_at <= clock_timestamp())
+              OR (status = 'running' AND lease_expires_at <= clock_timestamp())
+            )
+          RETURNING *`,
+          [tenantId, taskId, now, maxAttempts],
+        )
+        const exhausted = exhaustedResult.rows[0]
+        if (exhausted) {
+          await client.query(
+            `UPDATE project_files SET parse_status = 'failed', updated_at = $3
+            WHERE tenant_id = $1 AND id = $2`,
+            [tenantId, exhausted.file_id, now],
+          )
+        }
+        return null
+      }
       await client.query(
         `UPDATE project_files SET parse_status = 'parsing', updated_at = $3
         WHERE tenant_id = $1 AND id = $2`,
         [tenantId, task.file_id, now],
       )
-      return mapTask(task)
+      return {
+        task: mapTask(task),
+        lease: { tenantId, taskId, workerId, token, expiresAt: timestamp(task.lease_expires_at!) },
+      }
     })
   }
 
+  async renewTaskLease(
+    lease: TaskLease,
+    now: string,
+    leaseExpiresAt: string,
+  ): Promise<TaskLease | null> {
+    const renewed = await this.pool.query<TaskRow>(
+      `UPDATE parse_tasks
+      SET lease_expires_at = clock_timestamp() + ($6::timestamptz - $5::timestamptz),
+        updated_at = $5
+      WHERE tenant_id = $1
+        AND id = $2
+        AND status = 'running'
+        AND lease_owner = $3
+        AND lease_token = $4
+        AND lease_expires_at > clock_timestamp()
+        AND $6::timestamptz > $5::timestamptz
+      RETURNING *`,
+      [lease.tenantId, lease.taskId, lease.workerId, lease.token, now, leaseExpiresAt],
+    )
+    const task = renewed.rows[0]
+    return task
+      ? {
+          ...lease,
+          expiresAt: timestamp(task.lease_expires_at!),
+        }
+      : null
+  }
+
   async completeTask(
-    tenantId: string,
-    taskId: string,
+    lease: TaskLease,
     requirements: Requirement[],
     now: string,
   ): Promise<ParseTask | null> {
     return this.withTransaction(async (client) => {
       const locked = await client.query<TaskRow>(
         `SELECT * FROM parse_tasks
-        WHERE tenant_id = $1 AND id = $2 AND status = 'running'
+        WHERE tenant_id = $1
+          AND id = $2
+          AND status = 'running'
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > clock_timestamp()
         FOR UPDATE`,
-        [tenantId, taskId],
+        [lease.tenantId, lease.taskId, lease.workerId, lease.token],
       )
       const task = locked.rows[0]
       if (!task) return null
 
       for (const requirement of requirements) {
         if (
-          requirement.tenantId !== tenantId ||
-          requirement.taskId !== taskId ||
+          requirement.tenantId !== lease.tenantId ||
+          requirement.taskId !== lease.taskId ||
           requirement.projectId !== task.project_id ||
           requirement.fileId !== task.file_id
         ) {
@@ -430,40 +544,114 @@ export class PostgresBidRepository implements BidRepository {
 
       const completed = await client.query<TaskRow>(
         `UPDATE parse_tasks
-        SET status = 'succeeded', progress = 100, finished_at = $3, updated_at = $3
-        WHERE tenant_id = $1 AND id = $2
+        SET status = 'succeeded', progress = 100, error = NULL,
+          finished_at = $5, updated_at = $5,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+        WHERE tenant_id = $1
+          AND id = $2
+          AND status = 'running'
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > clock_timestamp()
         RETURNING *`,
-        [tenantId, taskId, now],
+        [lease.tenantId, lease.taskId, lease.workerId, lease.token, now],
       )
       await client.query(
         `UPDATE project_files SET parse_status = 'parsed', updated_at = $3
         WHERE tenant_id = $1 AND id = $2`,
-        [tenantId, task.file_id, now],
+        [lease.tenantId, task.file_id, now],
       )
       return mapTask(completed.rows[0]!)
     })
   }
 
   async failTask(
-    tenantId: string,
-    taskId: string,
-    error: { code: string; message: string },
+    lease: TaskLease,
+    error: TaskError,
     now: string,
+    deadLetter: boolean,
   ): Promise<ParseTask | null> {
     return this.withTransaction(async (client) => {
       const failed = await client.query<TaskRow>(
         `UPDATE parse_tasks
-        SET status = 'failed', error = $3::jsonb, finished_at = $4, updated_at = $4
-        WHERE tenant_id = $1 AND id = $2 AND status IN ('queued', 'running')
+        SET status = 'failed', error = $5::jsonb, finished_at = $6, updated_at = $6,
+          dead_lettered_at = CASE WHEN $7::boolean THEN $6::timestamptz ELSE NULL END,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+        WHERE tenant_id = $1
+          AND id = $2
+          AND status = 'running'
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > clock_timestamp()
         RETURNING *`,
-        [tenantId, taskId, JSON.stringify(error), now],
+        [
+          lease.tenantId,
+          lease.taskId,
+          lease.workerId,
+          lease.token,
+          JSON.stringify(error),
+          now,
+          deadLetter,
+        ],
       )
       const task = failed.rows[0]
       if (!task) return null
       await client.query(
         `UPDATE project_files SET parse_status = 'failed', updated_at = $3
         WHERE tenant_id = $1 AND id = $2`,
-        [tenantId, task.file_id, now],
+        [lease.tenantId, task.file_id, now],
+      )
+      return mapTask(task)
+    })
+  }
+
+  async requeueTask(
+    lease: TaskLease,
+    error: TaskError,
+    now: string,
+    availableAt: string,
+  ): Promise<ParseTask | null> {
+    return this.withTransaction(async (client) => {
+      const requeued = await client.query<TaskRow>(
+        `UPDATE parse_tasks
+        SET status = 'queued', progress = 0, error = $5::jsonb,
+          started_at = NULL, finished_at = NULL, updated_at = $6,
+          next_attempt_at = clock_timestamp() + ($7::timestamptz - $6::timestamptz),
+          dead_lettered_at = NULL,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+        WHERE tenant_id = $1
+          AND id = $2
+          AND status = 'running'
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > clock_timestamp()
+        RETURNING *`,
+        [
+          lease.tenantId,
+          lease.taskId,
+          lease.workerId,
+          lease.token,
+          JSON.stringify(error),
+          now,
+          availableAt,
+        ],
+      )
+      const task = requeued.rows[0]
+      if (!task) return null
+      await client.query(
+        `UPDATE project_files SET parse_status = 'queued', updated_at = $3
+        WHERE tenant_id = $1 AND id = $2`,
+        [lease.tenantId, task.file_id, now],
+      )
+      await client.query(
+        `INSERT INTO task_outbox (
+          id, tenant_id, task_id, publish_attempts, available_at, created_at
+        ) VALUES (
+          $1,$2,$3,0,
+          clock_timestamp() + ($4::timestamptz - $5::timestamptz),
+          $5
+        )`,
+        [createId(), lease.tenantId, lease.taskId, availableAt, now],
       )
       return mapTask(task)
     })
@@ -474,7 +662,10 @@ export class PostgresBidRepository implements BidRepository {
       const retried = await client.query<TaskRow>(
         `UPDATE parse_tasks
         SET status = 'queued', progress = 0, error = NULL, started_at = NULL,
-          finished_at = NULL, updated_at = $3
+          finished_at = NULL, updated_at = $3, attempt = 0,
+          next_attempt_at = clock_timestamp(),
+          dead_lettered_at = NULL,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
         WHERE tenant_id = $1 AND id = $2 AND status = 'failed'
         RETURNING *`,
         [tenantId, taskId, now],
@@ -486,8 +677,84 @@ export class PostgresBidRepository implements BidRepository {
         WHERE tenant_id = $1 AND id = $2`,
         [tenantId, task.file_id, now],
       )
+      await client.query(
+        `INSERT INTO task_outbox (
+          id, tenant_id, task_id, publish_attempts, available_at, created_at
+        ) VALUES ($1,$2,$3,0,clock_timestamp(),$4)`,
+        [createId(), tenantId, taskId, now],
+      )
       return mapTask(task)
     })
+  }
+
+  async claimOutboxEvents(
+    workerId: string,
+    now: string,
+    leaseExpiresAt: string,
+    limit: number,
+  ): Promise<TaskOutboxEvent[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1) return []
+    const result = await this.pool.query<OutboxRow>(
+      `WITH candidates AS (
+        SELECT id
+        FROM task_outbox
+        WHERE published_at IS NULL
+          AND available_at <= clock_timestamp()
+          AND (lease_owner IS NULL OR lease_expires_at <= clock_timestamp())
+        ORDER BY available_at, created_at, id
+        FOR UPDATE SKIP LOCKED
+        LIMIT $4
+      )
+      UPDATE task_outbox AS event
+      SET lease_owner = $1,
+        lease_expires_at = clock_timestamp() + ($3::timestamptz - $2::timestamptz),
+        publish_attempts = event.publish_attempts + 1,
+        last_error = NULL
+      FROM candidates
+      WHERE event.id = candidates.id
+        AND $3::timestamptz > $2::timestamptz
+      RETURNING event.*`,
+      [workerId, now, leaseExpiresAt, limit],
+    )
+    return result.rows.map(mapOutboxEvent)
+  }
+
+  async markOutboxEventPublished(
+    eventId: string,
+    workerId: string,
+    publishedAt: string,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE task_outbox
+      SET published_at = $3, lease_owner = NULL, lease_expires_at = NULL, last_error = NULL
+      WHERE id = $1
+        AND lease_owner = $2
+        AND published_at IS NULL
+        AND lease_expires_at > clock_timestamp()`,
+      [eventId, workerId, publishedAt],
+    )
+    return result.rowCount === 1
+  }
+
+  async releaseOutboxEvent(
+    eventId: string,
+    workerId: string,
+    error: TaskError,
+    releasedAt: string,
+    availableAt: string,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE task_outbox
+      SET available_at = clock_timestamp() + ($5::timestamptz - $4::timestamptz),
+        lease_owner = NULL, lease_expires_at = NULL,
+        last_error = $3::jsonb
+      WHERE id = $1
+        AND lease_owner = $2
+        AND published_at IS NULL
+        AND lease_expires_at > clock_timestamp()`,
+      [eventId, workerId, JSON.stringify(error), releasedAt, availableAt],
+    )
+    return result.rowCount === 1
   }
 
   async listRequirements(

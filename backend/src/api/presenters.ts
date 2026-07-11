@@ -36,6 +36,7 @@ export function presentTask(task: ParseTask): Omit<ParseTask, 'tenantId'> {
     type: task.type,
     status: task.status,
     progress: task.progress,
+    attempt: task.attempt,
     error: task.error,
     createdAt: task.createdAt,
     startedAt: task.startedAt,

@@ -18,6 +18,19 @@ export interface AppConfig {
   s3AccessKeyId: string | null
   s3SecretAccessKey: string | null
   s3ForcePathStyle: boolean
+  redisUrl: string | null
+  redisStreamKey: string
+  redisConsumerGroup: string
+  redisClaimIdleMs: number
+  workerId: string | null
+  workerConcurrency: number
+  taskLeaseMs: number
+  taskHeartbeatMs: number
+  taskMaxAttempts: number
+  taskRetryBackoffMs: number
+  outboxPollIntervalMs: number
+  outboxLeaseMs: number
+  outboxBatchSize: number
   devTenantId: string
   maxUploadBytes: number
   devParserDelayMs: number
@@ -70,11 +83,44 @@ function parseS3Endpoint(value: string | undefined): string | null {
   return endpoint
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+function parseRedisUrl(value: string | undefined): string | null {
+  if (value === undefined) return null
+  const url = value.trim()
+  if (url.length === 0) throw new Error('REDIS_URL must not be empty')
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error('REDIS_URL must be a valid redis:// or rediss:// URL')
+  }
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    throw new Error('REDIS_URL must be a valid redis:// or rediss:// URL')
+  }
+  return url
+}
+
+function parseNonEmpty(value: string | undefined, fallback: string, name: string): string {
+  const parsed = value?.trim() ?? fallback
+  if (parsed.length === 0 || parsed.length > 128) {
+    throw new Error(`${name} must contain 1 to 128 characters`)
+  }
+  return parsed
+}
+
+interface LoadConfigOptions {
+  worker?: boolean
+}
+
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadConfigOptions = {},
+): AppConfig {
+  const includeWorker = options.worker ?? true
   const driver = env.REPOSITORY_DRIVER ?? 'memory'
   if (driver !== 'memory' && driver !== 'postgres') {
     throw new Error('REPOSITORY_DRIVER must be either memory or postgres')
   }
+  const includeTaskRuntime = includeWorker || driver === 'memory'
 
   const objectStorageDriver = env.OBJECT_STORAGE_DRIVER ?? 'memory'
   if (objectStorageDriver !== 'memory' && objectStorageDriver !== 's3') {
@@ -92,6 +138,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (objectStorageDriver === 's3' && s3Bucket === null) {
     throw new Error('S3_BUCKET is required when OBJECT_STORAGE_DRIVER=s3')
+  }
+
+  const taskLeaseMs = includeTaskRuntime
+    ? parsePositiveInteger(env.TASK_LEASE_MS, 30_000, 'TASK_LEASE_MS')
+    : 30_000
+  const taskHeartbeatMs = includeWorker
+    ? parsePositiveInteger(env.TASK_HEARTBEAT_MS, 10_000, 'TASK_HEARTBEAT_MS')
+    : 10_000
+  if (includeWorker && taskHeartbeatMs >= taskLeaseMs) {
+    throw new Error('TASK_HEARTBEAT_MS must be less than TASK_LEASE_MS')
+  }
+  const redisClaimIdleMs = includeWorker
+    ? parsePositiveInteger(env.REDIS_CLAIM_IDLE_MS, 60_000, 'REDIS_CLAIM_IDLE_MS')
+    : 60_000
+  if (includeWorker && redisClaimIdleMs < taskLeaseMs) {
+    throw new Error('REDIS_CLAIM_IDLE_MS must be greater than or equal to TASK_LEASE_MS')
+  }
+  const workerId = includeWorker ? env.WORKER_ID?.trim() || null : null
+  if (workerId !== null && !/^[a-zA-Z0-9._:-]{1,128}$/.test(workerId)) {
+    throw new Error('WORKER_ID must contain only letters, digits, dots, underscores, colons, or hyphens')
   }
 
   const devTenantId = env.DEV_TENANT_ID ?? 'tenant-demo'
@@ -123,8 +189,43 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     s3AccessKeyId,
     s3SecretAccessKey,
     s3ForcePathStyle: parseStrictBoolean(env.S3_FORCE_PATH_STYLE, false, 'S3_FORCE_PATH_STYLE'),
+    redisUrl: includeWorker ? parseRedisUrl(env.REDIS_URL) : null,
+    redisStreamKey: includeWorker
+      ? parseNonEmpty(env.REDIS_STREAM_KEY, 'aibid:parse-tasks', 'REDIS_STREAM_KEY')
+      : 'aibid:parse-tasks',
+    redisConsumerGroup: includeWorker
+      ? parseNonEmpty(env.REDIS_CONSUMER_GROUP, 'aibid-parser', 'REDIS_CONSUMER_GROUP')
+      : 'aibid-parser',
+    redisClaimIdleMs,
+    workerId,
+    workerConcurrency: includeWorker
+      ? parsePositiveInteger(env.WORKER_CONCURRENCY, 2, 'WORKER_CONCURRENCY')
+      : 2,
+    taskLeaseMs,
+    taskHeartbeatMs,
+    taskMaxAttempts: includeTaskRuntime
+      ? parsePositiveInteger(env.TASK_MAX_ATTEMPTS, 3, 'TASK_MAX_ATTEMPTS')
+      : 3,
+    taskRetryBackoffMs: includeWorker
+      ? parsePositiveInteger(env.TASK_RETRY_BACKOFF_MS, 1_000, 'TASK_RETRY_BACKOFF_MS')
+      : 1_000,
+    outboxPollIntervalMs: includeWorker
+      ? parsePositiveInteger(env.OUTBOX_POLL_INTERVAL_MS, 250, 'OUTBOX_POLL_INTERVAL_MS')
+      : 250,
+    outboxLeaseMs: includeWorker
+      ? parsePositiveInteger(env.OUTBOX_LEASE_MS, 10_000, 'OUTBOX_LEASE_MS')
+      : 10_000,
+    outboxBatchSize: includeWorker
+      ? parsePositiveInteger(env.OUTBOX_BATCH_SIZE, 20, 'OUTBOX_BATCH_SIZE')
+      : 20,
     devTenantId,
     maxUploadBytes: parseInteger(env.MAX_UPLOAD_BYTES, 25 * 1024 * 1024, 'MAX_UPLOAD_BYTES'),
-    devParserDelayMs: parseInteger(env.DEV_PARSER_DELAY_MS, 250, 'DEV_PARSER_DELAY_MS'),
+    devParserDelayMs: includeTaskRuntime
+      ? parseInteger(env.DEV_PARSER_DELAY_MS, 250, 'DEV_PARSER_DELAY_MS')
+      : 250,
   }
+}
+
+export function loadApiConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  return loadConfig(env, { worker: false })
 }

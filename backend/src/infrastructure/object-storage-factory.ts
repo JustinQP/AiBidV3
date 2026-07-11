@@ -27,3 +27,4 @@ export function createObjectStorage(config: AppConfig): ObjectStorage {
     requestTimeoutMs: config.objectStorageTimeoutMs,
   })
 }
+

@@ -19,3 +19,4 @@ export async function createRepository(config: AppConfig): Promise<BidRepository
   }
   return new PostgresBidRepository(pool)
 }
+

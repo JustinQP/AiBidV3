@@ -7,7 +7,7 @@ import { FileContentLoader } from './application/file-content-loader.js'
 import { UploadIngestionService } from './application/upload-ingestion-service.js'
 import { UploadProcessingService } from './application/upload-processing-service.js'
 import { registerRoutes } from './api/routes.js'
-import { loadConfig } from './config.js'
+import { loadApiConfig } from './config.js'
 import type { AppConfig } from './config.js'
 import type { ObjectStorage } from './domain/object-storage.js'
 import type { BidRepository } from './domain/repository.js'
@@ -23,30 +23,31 @@ export interface BuildAppOptions {
 }
 
 export async function buildApp(options: BuildAppOptions = {}) {
-  const config = options.config ?? loadConfig()
+  const config = options.config ?? loadApiConfig()
   const repository = options.repository ?? (await createRepository(config))
   const objectStorage = options.objectStorage ?? createObjectStorage(config)
   const app = Fastify({
     logger: options.enableLogger ? { level: config.logLevel } : false,
     bodyLimit: 1024 * 1024,
   })
-  const processor = new UploadProcessingService(
-    repository,
-    new FileContentLoader(repository, objectStorage),
-    new DevelopmentDocumentParser(),
-    config.devParserDelayMs,
-    (error, context) => app.log.error({ err: error, ...context }, 'development parser task failed'),
-  )
+  const processor = config.repositoryDriver === 'memory'
+    ? new UploadProcessingService(
+        repository,
+        new FileContentLoader(repository, objectStorage),
+        new DevelopmentDocumentParser(),
+        config.devParserDelayMs,
+        'in-process-development',
+        config.taskLeaseMs,
+        config.taskMaxAttempts,
+        (error, context) => app.log.error({ err: error, ...context }, 'development parser task failed'),
+      )
+    : null
   const ingestion = new UploadIngestionService(repository, objectStorage, (error, context) => {
     app.log.error(
       { dependencyError: dependencyErrorDiagnostic(error), ...context },
       'upload ingestion recovery requires attention',
     )
   })
-  const recoveredTasks = await repository.recoverPendingTasks()
-  for (const task of recoveredTasks) {
-    processor.enqueue(task.tenantId, task.id)
-  }
 
   await app.register(cors, {
     origin: config.corsOrigins,
@@ -100,9 +101,14 @@ export async function buildApp(options: BuildAppOptions = {}) {
     })
   })
 
-  await registerRoutes(app, { config, repository, ingestion, processor })
+  await registerRoutes(app, {
+    config,
+    repository,
+    ingestion,
+    taskStarter: processor ?? { enqueue: () => undefined },
+  })
   app.addHook('onClose', async () => {
-    await processor.waitForIdle()
+    await processor?.waitForIdle()
     try {
       await repository.close()
     } finally {

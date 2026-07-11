@@ -23,6 +23,10 @@ const projectId = createId()
 const now = new Date().toISOString()
 let uploadedObject: ObjectReference | null = null
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
 try {
   await objectStorage.ping()
   await repository.createProject({
@@ -89,6 +93,7 @@ try {
       type: 'development-document-parse',
       status: 'queued',
       progress: 0,
+      attempt: 0,
       error: null,
       createdAt: now,
       startedAt: null,
@@ -107,12 +112,66 @@ try {
   if (storedMetadata.rows[0]?.content !== null || storedMetadata.rows[0]?.object_key !== uploadedObject.key) {
     throw new Error('PostgreSQL repository did not persist an object-backed file without bytea content')
   }
-  await repository.markTaskRunning(tenantId, taskId, new Date().toISOString())
-  const recovered = await repository.recoverPendingTasks()
-  if (!recovered.some((task) => task.id === taskId && task.status === 'queued')) {
-    throw new Error('PostgreSQL repository did not recover its running task')
+  const relayNow = new Date(Date.parse(now) + 1_000).toISOString()
+  const outboxEvents = await repository.claimOutboxEvents(
+    'smoke-relay',
+    relayNow,
+    new Date(Date.parse(relayNow) + 10_000).toISOString(),
+    10,
+  )
+  const uploadEvent = outboxEvents.find((event) => event.taskId === taskId)
+  if (!uploadEvent) throw new Error('PostgreSQL repository did not create an upload outbox event')
+  if (!await repository.markOutboxEventPublished(uploadEvent.id, 'smoke-relay', relayNow)) {
+    throw new Error('PostgreSQL repository could not mark its upload outbox event as published')
   }
-  await repository.markTaskRunning(tenantId, taskId, new Date().toISOString())
+
+  const firstClaimAt = new Date(Date.parse(now) + 2_000).toISOString()
+  const firstLeaseExpiry = new Date(Date.parse(firstClaimAt) + 100).toISOString()
+  const firstClaim = await repository.claimTask(
+    tenantId,
+    taskId,
+    'smoke-worker-a',
+    firstClaimAt,
+    firstLeaseExpiry,
+    config.taskMaxAttempts,
+  )
+  if (!firstClaim || firstClaim.task.attempt !== 1) {
+    throw new Error('PostgreSQL repository could not claim the queued task with its first lease')
+  }
+  const blockedClaim = await repository.claimTask(
+    tenantId,
+    taskId,
+    'smoke-worker-b',
+    new Date(Date.parse(firstClaimAt) + 50).toISOString(),
+    new Date(Date.parse(firstClaimAt) + 5_000).toISOString(),
+    config.taskMaxAttempts,
+  )
+  if (blockedClaim) throw new Error('PostgreSQL repository allowed a live task lease to be stolen')
+
+  await delay(150)
+  const forgedLiveTimestamp = new Date(Date.parse(firstClaimAt) + 50).toISOString()
+  const expiredFailure = await repository.failTask(
+    firstClaim.lease,
+    { code: 'CLOCK_SKEW_PROBE', message: 'A stale caller timestamp must not extend a lease' },
+    forgedLiveTimestamp,
+    true,
+  )
+  if (expiredFailure) {
+    throw new Error('PostgreSQL repository trusted a worker timestamp after the database lease expired')
+  }
+
+  const secondClaimAt = new Date().toISOString()
+  const secondClaim = await repository.claimTask(
+    tenantId,
+    taskId,
+    'smoke-worker-b',
+    secondClaimAt,
+    new Date(Date.parse(secondClaimAt) + 30_000).toISOString(),
+    config.taskMaxAttempts,
+  )
+  if (!secondClaim || secondClaim.task.attempt !== 2) {
+    throw new Error('PostgreSQL repository did not recover an expired task lease')
+  }
   const fileContentLoader = new FileContentLoader(repository, objectStorage)
   const storedFile = await fileContentLoader.loadForProcessing(tenantId, fileId)
   if (!storedFile) throw new Error('PostgreSQL repository could not read its uploaded file')
@@ -148,12 +207,141 @@ try {
   if (!legacyStoredFile?.content.equals(legacyContent)) {
     throw new Error('PostgreSQL repository could not read a migration-era bytea file')
   }
+
+  const retryRaceTaskId = createId()
+  const retryRaceCreatedAt = new Date().toISOString()
+  await pool.query(
+    `INSERT INTO parse_tasks (
+      id, tenant_id, project_id, file_id, type, status, progress, error,
+      created_at, started_at, finished_at, updated_at
+    ) VALUES ($1,$2,$3,$4,'development-document-parse','queued',0,NULL,$5,NULL,NULL,$5)`,
+    [retryRaceTaskId, tenantId, projectId, legacyFileId, retryRaceCreatedAt],
+  )
+  const retryRaceClaimedAt = new Date()
+  const retryRaceClaim = await repository.claimTask(
+    tenantId,
+    retryRaceTaskId,
+    'smoke-retry-race-worker-a',
+    retryRaceClaimedAt.toISOString(),
+    new Date(retryRaceClaimedAt.getTime() + 50).toISOString(),
+    3,
+  )
+  if (!retryRaceClaim) throw new Error('PostgreSQL retry race fixture could not claim its task')
+  await delay(75)
+
+  const requeueClient = await pool.connect()
+  let requeueTransactionOpen = false
+  try {
+    await requeueClient.query('BEGIN')
+    requeueTransactionOpen = true
+    const requeued = await requeueClient.query(
+      `UPDATE parse_tasks
+      SET status = 'queued', progress = 0,
+        error = jsonb_build_object('code', 'OBJECT_STORAGE_UNAVAILABLE', 'message', 'retry later'),
+        started_at = NULL, finished_at = NULL, updated_at = clock_timestamp(),
+        next_attempt_at = clock_timestamp() + interval '30 seconds',
+        lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+      WHERE tenant_id = $1 AND id = $2 AND lease_token = $3
+      RETURNING id`,
+      [tenantId, retryRaceTaskId, retryRaceClaim.lease.token],
+    )
+    if (requeued.rowCount !== 1) throw new Error('PostgreSQL retry race fixture could not requeue')
+
+    const concurrentClaimedAt = new Date()
+    const concurrentClaim = repository.claimTask(
+      tenantId,
+      retryRaceTaskId,
+      'smoke-retry-race-worker-b',
+      concurrentClaimedAt.toISOString(),
+      new Date(concurrentClaimedAt.getTime() + 30_000).toISOString(),
+      3,
+    )
+    await delay(50)
+    await requeueClient.query(
+      `INSERT INTO task_outbox (
+        id, tenant_id, task_id, publish_attempts, available_at, created_at
+      ) VALUES ($1,$2,$3,0,clock_timestamp() + interval '30 seconds',clock_timestamp())`,
+      [createId(), tenantId, retryRaceTaskId],
+    )
+    await requeueClient.query('COMMIT')
+    requeueTransactionOpen = false
+
+    if (await concurrentClaim) {
+      throw new Error('PostgreSQL claim bypassed retry backoff during a concurrent requeue')
+    }
+    const retryRaceTask = await repository.findTask(tenantId, retryRaceTaskId)
+    if (retryRaceTask?.status !== 'queued' || retryRaceTask.attempt !== 1) {
+      throw new Error('PostgreSQL retry race did not preserve the delayed queued task')
+    }
+  } catch (error) {
+    if (requeueTransactionOpen) await requeueClient.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    requeueClient.release()
+  }
+
+  const crashTaskId = createId()
+  const crashTaskCreatedAt = new Date().toISOString()
+  await pool.query(
+    `INSERT INTO parse_tasks (
+      id, tenant_id, project_id, file_id, type, status, progress, error,
+      created_at, started_at, finished_at, updated_at
+    ) VALUES ($1,$2,$3,$4,'development-document-parse','queued',0,NULL,$5,NULL,NULL,$5)`,
+    [crashTaskId, tenantId, projectId, legacyFileId, crashTaskCreatedAt],
+  )
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const claimedAt = new Date()
+    const crashClaim = await repository.claimTask(
+      tenantId,
+      crashTaskId,
+      `smoke-crash-worker-${attempt}`,
+      claimedAt.toISOString(),
+      new Date(claimedAt.getTime() + 50).toISOString(),
+      3,
+    )
+    if (crashClaim?.task.attempt !== attempt) {
+      throw new Error(`PostgreSQL repository did not grant crash attempt ${attempt}`)
+    }
+    await delay(75)
+  }
+  const exhaustedAt = new Date()
+  const exhaustedClaim = await repository.claimTask(
+    tenantId,
+    crashTaskId,
+    'smoke-crash-worker-exhausted',
+    exhaustedAt.toISOString(),
+    new Date(exhaustedAt.getTime() + 50).toISOString(),
+    3,
+  )
+  const exhaustedTask = await repository.findTask(tenantId, crashTaskId)
+  if (
+    exhaustedClaim !== null ||
+    exhaustedTask?.status !== 'failed' ||
+    exhaustedTask.attempt !== 3 ||
+    exhaustedTask.error?.code !== 'TASK_ATTEMPTS_EXHAUSTED'
+  ) {
+    throw new Error('PostgreSQL repository did not dead-letter a repeatedly crashed task')
+  }
+
   const requirements = await new DevelopmentDocumentParser().parse(
     storedFile,
     taskId,
-    new Date().toISOString(),
+    secondClaimAt,
   )
-  await repository.completeTask(tenantId, taskId, requirements, new Date().toISOString())
+  const staleCompletion = await repository.completeTask(
+    firstClaim.lease,
+    requirements,
+    new Date(Date.parse(secondClaimAt) + 1_000).toISOString(),
+  )
+  if (staleCompletion) throw new Error('PostgreSQL repository accepted a stale worker fencing token')
+  const completed = await repository.completeTask(
+    secondClaim.lease,
+    requirements,
+    new Date(Date.parse(secondClaimAt) + 2_000).toISOString(),
+  )
+  if (completed?.status !== 'succeeded') {
+    throw new Error('PostgreSQL repository could not complete the task with its current lease')
+  }
   const persistedRequirements = await repository.listRequirements(tenantId, projectId, {})
   if (persistedRequirements.length !== requirements.length) {
     throw new Error('PostgreSQL repository could not persist parsed requirements')

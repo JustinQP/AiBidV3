@@ -80,6 +80,19 @@ jobs:
       S3_ACCESS_KEY: aibid-ci
       S3_SECRET_KEY: aibid-ci-secret
       S3_FORCE_PATH_STYLE: "true"
+      REDIS_URL: redis://localhost:6379/0
+      REDIS_STREAM_KEY: aibid:parse-tasks
+      REDIS_CONSUMER_GROUP: aibid-parser
+      REDIS_CLAIM_IDLE_MS: "60000"
+      WORKER_ID: worker-ci-1
+      WORKER_CONCURRENCY: "2"
+      TASK_LEASE_MS: "30000"
+      TASK_HEARTBEAT_MS: "10000"
+      TASK_MAX_ATTEMPTS: "3"
+      TASK_RETRY_BACKOFF_MS: "1000"
+      OUTBOX_POLL_INTERVAL_MS: "250"
+      OUTBOX_LEASE_MS: "10000"
+      OUTBOX_BATCH_SIZE: "20"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -94,7 +107,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Start and initialize MinIO
+      - name: Start Redis and initialize MinIO
         working-directory: ${{ github.workspace }}
         env:
           MINIO_ROOT_USER: aibid-ci
@@ -103,7 +116,7 @@ jobs:
           MINIO_API_PORT: 9000
           MINIO_CONSOLE_PORT: 9001
         run: |
-          docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up -d --wait minio
+          docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up -d --wait redis minio
           docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up --no-deps minio-init
 
       - name: Run backend checks
@@ -115,10 +128,18 @@ jobs:
       - name: Run persistence smoke test
         run: npm run db:smoke
 
+      - name: Run durable worker smoke test
+        run: npm run worker:smoke
+
+      - name: Show infrastructure logs on failure
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml logs redis minio minio-init
+
   contracts:
-    name: Contract and Compose validation
+    name: Contract and full-stack validation
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -133,3 +154,17 @@ jobs:
 
       - name: Validate Docker Compose configuration
         run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml config --quiet
+
+      - name: Start production API and worker Compose stack
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up -d --build
+
+      - name: Run HTTP to independent worker full-stack smoke
+        run: node deploy/full-stack-smoke.mjs
+
+      - name: Show full-stack logs on failure
+        if: failure()
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml logs
+
+      - name: Stop full-stack services
+        if: always()
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml down --volumes
