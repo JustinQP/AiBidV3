@@ -60,8 +60,17 @@ function parseEntries(raw: unknown): TaskQueueDelivery[] {
 }
 
 function parseReadGroupReply(raw: unknown): TaskQueueDelivery[] {
-  if (!Array.isArray(raw)) return []
   const deliveries: TaskQueueDelivery[] = []
+  if (raw instanceof Map) {
+    for (const entries of raw.values()) deliveries.push(...parseEntries(entries))
+    return deliveries
+  }
+  if (!Array.isArray(raw)) {
+    if (typeof raw === 'object' && raw !== null) {
+      for (const entries of Object.values(raw)) deliveries.push(...parseEntries(entries))
+    }
+    return deliveries
+  }
   for (const stream of raw) {
     if (!Array.isArray(stream) || stream.length < 2) continue
     deliveries.push(...parseEntries(stream[1]))

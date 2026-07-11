@@ -495,6 +495,30 @@ describe('OutboxRelay', () => {
 })
 
 describe('RedisTaskQueue', () => {
+  it('parses RESP3 object replies returned by node-redis 6 for XREADGROUP', async () => {
+    const commands = new FakeRedisClient()
+    const reads = new FakeRedisClient()
+    commands.duplicateClient = reads
+    commands.replies.push('OK')
+    reads.replies.push({
+      'aibid:parse-tasks': [
+        ['2-0', ['eventId', 'event-2', 'tenantId', TENANT_ID, 'taskId', TASK_ID]],
+      ],
+    })
+    const queue = new RedisTaskQueue({
+      url: 'redis://not-logged.invalid:6379',
+      streamKey: 'aibid:parse-tasks',
+      consumerGroup: 'aibid-parser',
+      client: commands as never,
+    })
+
+    await queue.connect()
+    expect(await queue.read('worker-1', { count: 1, blockMs: 100 })).toEqual([
+      { deliveryId: '2-0', eventId: 'event-2', tenantId: TENANT_ID, taskId: TASK_ID },
+    ])
+    await queue.close()
+  })
+
   it('uses the consumer-group stream commands and parses their raw replies', async () => {
     const commands = new FakeRedisClient()
     const reads = new FakeRedisClient()
