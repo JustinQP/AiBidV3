@@ -12,9 +12,15 @@ import type {
   RequirementPriority,
 } from '../domain/models.js'
 import type { BidRepository } from '../domain/repository.js'
-import { badRequest, notFound, payloadTooLarge, unsupportedMediaType } from '../lib/app-error.js'
+import {
+  AppError,
+  badRequest,
+  dependencyErrorDiagnostic,
+  notFound,
+  payloadTooLarge,
+  unsupportedMediaType,
+} from '../lib/app-error.js'
 import { createId } from '../lib/id.js'
-import type { UploadProcessingService } from '../application/upload-processing-service.js'
 import type { UploadIngestionService } from '../application/upload-ingestion-service.js'
 import { presentFile, presentProject, presentRequirement, presentTask } from './presenters.js'
 import { getTenantId } from './tenant-context.js'
@@ -23,7 +29,7 @@ interface RouteDependencies {
   config: AppConfig
   repository: BidRepository
   ingestion: UploadIngestionService
-  processor: UploadProcessingService
+  taskStarter: { enqueue(tenantId: string, taskId: string): void }
 }
 
 interface ProjectParams {
@@ -118,10 +124,19 @@ export async function registerRoutes(
   app: FastifyInstance,
   dependencies: RouteDependencies,
 ): Promise<void> {
-  const { config, repository, ingestion, processor } = dependencies
+  const { config, repository, ingestion, taskStarter } = dependencies
 
   app.get('/health', async () => {
-    await Promise.all([repository.ping(), ingestion.ping()])
+    const repositoryHealth = repository.ping().catch((error: unknown) => {
+      throw new AppError(
+        503,
+        'DATABASE_UNAVAILABLE',
+        'Database is temporarily unavailable',
+        'Service Unavailable',
+        dependencyErrorDiagnostic(error),
+      )
+    })
+    await Promise.all([repositoryHealth, ingestion.ping()])
     return {
       data: {
         status: 'ok',
@@ -224,6 +239,7 @@ export async function registerRoutes(
       type: 'development-document-parse',
       status: 'queued',
       progress: 0,
+      attempt: 0,
       error: null,
       createdAt: now,
       startedAt: null,
@@ -231,7 +247,7 @@ export async function registerRoutes(
       updatedAt: now,
     }
     const created = await ingestion.ingest({ file, task, content })
-    processor.enqueue(tenantId, taskId)
+    taskStarter.enqueue(tenantId, taskId)
     return reply.code(202).send({
       data: { file: presentFile(created.file), task: presentTask(created.task) },
     })
@@ -263,7 +279,7 @@ export async function registerRoutes(
     }
     const retried = await repository.retryTask(tenantId, taskId, new Date().toISOString())
     if (!retried) throw badRequest('TASK_NOT_RETRYABLE', 'Task can no longer be retried')
-    processor.enqueue(tenantId, taskId)
+    taskStarter.enqueue(tenantId, taskId)
     return reply.code(202).send({ data: presentTask(retried) })
   })
 

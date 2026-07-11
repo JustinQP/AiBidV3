@@ -66,3 +66,4 @@ const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url)
 if (isDirectExecution) {
   await main()
 }
+

@@ -20,8 +20,6 @@ services:
       DEV_PARSER_DELAY_MS: ${DEV_PARSER_DELAY_MS:-250}
       OBJECT_STORAGE_DRIVER: ${OBJECT_STORAGE_DRIVER:-s3}
       OBJECT_STORAGE_TIMEOUT_MS: ${OBJECT_STORAGE_TIMEOUT_MS:-10000}
-      # Redis remains reserved for the Phase C durable queue and worker.
-      REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-aibid-dev}
@@ -32,6 +30,57 @@ services:
       - "${API_PORT:-3000}:3000"
     depends_on:
       postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: ["npm", "run", "worker:prod"]
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      REPOSITORY_DRIVER: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aibid}:${POSTGRES_PASSWORD:-change-me-local-only}@postgres:5432/${POSTGRES_DB:-aibid}
+      DATABASE_SSL: "false"
+      MIGRATE_ON_START: "false"
+      OBJECT_STORAGE_DRIVER: ${OBJECT_STORAGE_DRIVER:-s3}
+      OBJECT_STORAGE_TIMEOUT_MS: ${OBJECT_STORAGE_TIMEOUT_MS:-10000}
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-aibid-dev}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-aibid-local}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me-local-only}
+      S3_FORCE_PATH_STYLE: "${S3_FORCE_PATH_STYLE:-true}"
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_STREAM_KEY: ${REDIS_STREAM_KEY:-aibid:parse-tasks}
+      REDIS_CONSUMER_GROUP: ${REDIS_CONSUMER_GROUP:-aibid-parser}
+      REDIS_CLAIM_IDLE_MS: ${REDIS_CLAIM_IDLE_MS:-60000}
+      WORKER_ID: ${WORKER_ID:-worker-local-1}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      TASK_LEASE_MS: ${TASK_LEASE_MS:-30000}
+      TASK_HEARTBEAT_MS: ${TASK_HEARTBEAT_MS:-10000}
+      TASK_MAX_ATTEMPTS: ${TASK_MAX_ATTEMPTS:-3}
+      TASK_RETRY_BACKOFF_MS: ${TASK_RETRY_BACKOFF_MS:-1000}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-250}
+      OUTBOX_LEASE_MS: ${OUTBOX_LEASE_MS:-10000}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-20}
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
@@ -57,7 +106,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:

@@ -47,3 +47,4 @@ export interface ObjectStorage {
   ping(): Promise<void>
   close(): Promise<void>
 }
+

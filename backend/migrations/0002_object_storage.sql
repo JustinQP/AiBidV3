@@ -31,3 +31,4 @@ ALTER TABLE project_files
 CREATE UNIQUE INDEX project_files_object_key_uidx
   ON project_files (object_key)
   WHERE object_key IS NOT NULL;
+

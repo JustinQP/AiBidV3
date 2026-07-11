@@ -9,7 +9,7 @@
 ```text
 AiBidV3/
 ├── frontend/   # Web 前端与当前高保真原型
-├── backend/    # Fastify API、开发解析适配器与 PostgreSQL 数据层
+├── backend/    # Fastify API、独立 worker、开发解析适配器与数据层
 ├── deploy/     # 本地 Compose、基础设施与运维说明
 └── docs/       # 产品、架构、接口与研发文档
 ```
@@ -20,14 +20,16 @@ AiBidV3/
 
 V0.1 高保真 Web 原型位于 [`frontend/`](frontend/)，默认仍使用 Mock 数据和 `localStorage`，核心演示流程不依赖后端。
 
-阶段 B 核心持久化纵向切片已经提供：
+阶段 C1 可靠 worker 纵向切片已经提供：
 
 - Node.js 24 LTS + Fastify 5 API，覆盖项目、文件上传、开发解析任务、要求查询与人工确认；
 - 内存和 PostgreSQL Repository，以及失败任务重试；
-- PostgreSQL、MinIO、Redis 的本地 Compose 编排，其中 API 已使用私有 MinIO bucket 保存新上传原件，Redis 留待阶段 C；
+- PostgreSQL outbox、Redis Streams consumer group、数据库任务租约与 fencing token；
+- 与 API 分离的 parser worker；PostgreSQL 模式由 worker 可靠执行，默认内存模式仍可进程内联调；
+- PostgreSQL、MinIO、Redis、API 和 worker 的本地 Compose 编排；
 - OpenAPI 契约和 MVP 技术方案。
 
-当前解析器只生成明确标记的固定开发数据，不进行真实 PDF/DOCX 内容提取；S3 模式的新上传原件进入对象存储，PostgreSQL 保存对象引用、任务和业务事实，旧 `bytea` 行仅作迁移兼容。前端已接通“项目创建 → 文件上传与任务轮询 → 解析结果 → 人工确认/驳回”的真实 API 纵向切片，默认仍使用 Mock 数据以保留完整演示流程。生产级认证授权、独立 worker、真实解析和正式 DOCX 渲染仍待后续阶段实现。
+当前 worker 仍调用只生成明确标记固定数据的 `DevelopmentDocumentParser`，不进行真实 PDF/DOCX 内容提取；这次交付验证的是任务可靠性，不是解析准确率。S3 模式的新上传原件进入对象存储，PostgreSQL 保存对象引用、任务和业务事实，旧 `bytea` 行仅作迁移兼容。高保真前端目前仍完全使用 Mock 数据和 `localStorage`，尚未接入这套真实 API；前后端联调是后续独立步骤。真实解析、locator、生产级认证授权和正式 DOCX 渲染也仍待后续阶段实现。
 
 ## 快速开始
 
@@ -41,16 +43,14 @@ npm run dev
 
 默认地址：`http://localhost:4173`
 
-如需验证真实 API 纵向切片，先启动后端，再复制 `frontend/.env.example` 为 `frontend/.env.local`，将 `VITE_DATA_SOURCE` 改为 `api` 后启动前端。API 模式目前只开放真实项目的“招标文件”和“智能解析”；`/projects/demo/*` 始终保留完整 Mock 演示。
-
-运行阶段 B API 与本地基础设施：
+运行 Phase C1 API、worker 与本地基础设施：
 
 ```bash
 cp deploy/.env.example deploy/.env
 docker compose --env-file deploy/.env -f deploy/docker-compose.yml up --build
 ```
 
-API 默认地址：`http://localhost:3000`。详细方式及数据清理说明见 [`deploy/README.md`](deploy/README.md)，零依赖内存模式见 [`backend/README.md`](backend/README.md)。
+API 默认地址：`http://localhost:3000`。可按 [`backend/README.md`](backend/README.md) 的 `curl` 示例独立验证 API；当前前端不会自动切换到该数据源。详细方式及数据清理说明见 [`deploy/README.md`](deploy/README.md)。
 
 工程检查：
 
@@ -67,6 +67,7 @@ npm run build
 - [文档索引](docs/README.md)
 - [产品设计方案](docs/PRODUCT_DESIGN.md)
 - [MVP 技术方案](docs/MVP_TECHNICAL_DESIGN.md)
+- [可靠任务交付 ADR](docs/adr/0001-durable-task-delivery.md)
 - [OpenAPI 接口契约](docs/api/openapi.yaml)
 - [前端原型说明](frontend/README.md)
 - [后端服务说明](backend/README.md)

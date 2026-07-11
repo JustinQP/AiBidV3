@@ -20,3 +20,4 @@ COPY --from=build /app/migrations ./migrations
 USER node
 EXPOSE 3000
 CMD ["node", "dist/server.js"]
+

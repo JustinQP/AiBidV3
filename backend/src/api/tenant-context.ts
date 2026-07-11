@@ -14,3 +14,4 @@ export function getTenantId(request: FastifyRequest, config: AppConfig): string 
   }
   return tenantId
 }
+

@@ -1,7 +1,7 @@
 import { buildApp } from './app.js'
-import { loadConfig } from './config.js'
+import { loadApiConfig } from './config.js'
 
-const config = loadConfig()
+const config = loadApiConfig()
 const app = await buildApp({ config, enableLogger: true })
 let closing = false
 

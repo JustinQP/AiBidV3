@@ -134,3 +134,4 @@ CREATE INDEX requirements_tenant_file_idx
 
 CREATE INDEX requirements_tenant_project_file_task_idx
   ON requirements (tenant_id, project_id, file_id, task_id);
+

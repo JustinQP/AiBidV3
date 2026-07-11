@@ -21,7 +21,17 @@ export class FileContentLoader {
   ) {}
 
   async loadForProcessing(tenantId: string, fileId: string): Promise<StoredProjectFile | null> {
-    const stored = await this.repository.findStoredFile(tenantId, fileId)
+    let stored
+    try {
+      stored = await this.repository.findStoredFile(tenantId, fileId)
+    } catch (error) {
+      if (error instanceof AppError) throw error
+      throw unavailable(
+        'DATABASE_UNAVAILABLE',
+        'Stored file metadata is temporarily unavailable',
+        error,
+      )
+    }
     if (!stored) return null
 
     let content: Buffer

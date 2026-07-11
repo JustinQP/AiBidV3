@@ -56,3 +56,4 @@ export function unsupportedMediaType(code: string, message: string): AppError {
 export function payloadTooLarge(code: string, message: string): AppError {
   return new AppError(413, code, message, 'Payload Too Large')
 }
+

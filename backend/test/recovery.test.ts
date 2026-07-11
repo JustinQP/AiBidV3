@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { afterEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { afterEach, describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
 import { UploadIngestionService } from '../src/application/upload-ingestion-service.js'
 import type { AppConfig } from '../src/config.js'
@@ -27,22 +27,35 @@ const config: AppConfig = {
   s3AccessKeyId: null,
   s3SecretAccessKey: null,
   s3ForcePathStyle: true,
+  redisUrl: null,
+  redisStreamKey: 'aibid:parse-tasks',
+  redisConsumerGroup: 'aibid-parser',
+  redisClaimIdleMs: 60_000,
+  workerId: null,
+  workerConcurrency: 2,
+  taskLeaseMs: 30_000,
+  taskHeartbeatMs: 10_000,
+  taskMaxAttempts: 3,
+  taskRetryBackoffMs: 1_000,
+  outboxPollIntervalMs: 250,
+  outboxLeaseMs: 10_000,
+  outboxBatchSize: 20,
   devTenantId: 'tenant-default',
   maxUploadBytes: 1024 * 1024,
   devParserDelayMs: 1,
 }
 
-describe('single-instance task recovery', () => {
+describe('task execution boundaries', () => {
   let app: FastifyInstance | undefined
 
   afterEach(async () => {
     await app?.close()
   })
 
-  it('returns queued memory tasks and re-enqueues them when the app starts', async () => {
+  it('leaves PostgreSQL-mode tasks queued for the independent worker', async () => {
     const repository = new InMemoryBidRepository()
     const objectStorage = new InMemoryObjectStorage()
-    const tenantId = 'tenant-recovery'
+    const tenantId = 'tenant-worker-boundary'
     const projectId = createId()
     const fileId = createId()
     const taskId = createId()
@@ -50,7 +63,7 @@ describe('single-instance task recovery', () => {
     await repository.createProject({
       id: projectId,
       tenantId,
-      name: '恢复测试项目',
+      name: '独立 Worker 边界测试',
       code: null,
       customerName: null,
       ownerName: null,
@@ -59,12 +72,12 @@ describe('single-instance task recovery', () => {
       createdAt: now,
       updatedAt: now,
     })
-    const content = Buffer.from('recovery')
+    const content = Buffer.from('durable worker boundary')
     const file: ProjectFile = {
       id: fileId,
       tenantId,
       projectId,
-      fileName: 'recovery.txt',
+      fileName: 'boundary.txt',
       mediaType: 'text/plain',
       sizeBytes: content.length,
       sha256: createHash('sha256').update(content).digest('hex'),
@@ -80,6 +93,7 @@ describe('single-instance task recovery', () => {
       type: 'development-document-parse',
       status: 'queued',
       progress: 0,
+      attempt: 0,
       error: null,
       createdAt: now,
       startedAt: null,
@@ -88,28 +102,35 @@ describe('single-instance task recovery', () => {
     }
     await new UploadIngestionService(repository, objectStorage).ingest({ file, task, content })
 
-    const recoverable = await repository.recoverPendingTasks()
-    expect(recoverable.map((task) => task.id)).toEqual([taskId])
+    app = await buildApp({
+      config: {
+        ...config,
+        repositoryDriver: 'postgres',
+        databaseUrl: 'postgresql://injected-repository',
+        objectStorageDriver: 's3',
+        s3Bucket: 'injected-storage',
+      },
+      repository,
+      objectStorage,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
 
-    app = await buildApp({ config, repository, objectStorage })
-    const recovered = await waitForRecoveredTask(repository, tenantId, taskId)
-    expect(recovered).toMatchObject({ status: 'succeeded', progress: 100 })
-    await expect(repository.listRequirements(tenantId, projectId, {})).resolves.toHaveLength(3)
+    await expect(repository.findTask(tenantId, taskId)).resolves.toMatchObject({
+      status: 'queued',
+      attempt: 0,
+    })
   })
 
-  it('fails a recovered task when stored bytes do not match the recorded digest', async () => {
+  it('keeps the zero-dependency memory mode interactive and fails corrupted content safely', async () => {
     const repository = new InMemoryBidRepository()
     const objectStorage = new CorruptingObjectStorage()
-    const tenantId = 'tenant-integrity'
+    const tenantId = 'tenant-memory-integrity'
     const projectId = createId()
-    const fileId = createId()
-    const taskId = createId()
     const now = new Date().toISOString()
-    const content = Buffer.from('integrity')
     await repository.createProject({
       id: projectId,
       tenantId,
-      name: '完整性校验测试',
+      name: '内存模式完整性测试',
       code: null,
       customerName: null,
       ownerName: null,
@@ -118,47 +139,36 @@ describe('single-instance task recovery', () => {
       createdAt: now,
       updatedAt: now,
     })
-    await new UploadIngestionService(repository, objectStorage).ingest({
-      file: {
-        id: fileId,
-        tenantId,
-        projectId,
-        fileName: 'integrity.txt',
-        mediaType: 'text/plain',
-        sizeBytes: content.length,
-        sha256: createHash('sha256').update(content).digest('hex'),
-        parseStatus: 'queued',
-        createdAt: now,
-        updatedAt: now,
-      },
-      task: {
-        id: taskId,
-        tenantId,
-        projectId,
-        fileId,
-        type: 'development-document-parse',
-        status: 'queued',
-        progress: 0,
-        error: null,
-        createdAt: now,
-        startedAt: null,
-        finishedAt: null,
-        updatedAt: now,
-      },
-      content,
-    })
-
     app = await buildApp({ config, repository, objectStorage })
-    const recovered = await waitForRecoveredTask(repository, tenantId, taskId)
 
-    expect(recovered).toMatchObject({
+    const boundary = 'aibid-memory-integrity-boundary'
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/projects/${projectId}/files`,
+      headers: {
+        'x-tenant-id': tenantId,
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: Buffer.from(
+        `--${boundary}\r\n` +
+          'Content-Disposition: form-data; name="file"; filename="integrity.txt"\r\n' +
+          'Content-Type: text/plain\r\n\r\n' +
+          'integrity bytes\r\n' +
+          `--${boundary}--\r\n`,
+      ),
+    })
+    expect(response.statusCode).toBe(202)
+    const taskId = response.json<{ data: { task: { id: string } } }>().data.task.id
+    const failed = await waitForTerminalTask(repository, tenantId, taskId)
+
+    expect(failed).toMatchObject({
       status: 'failed',
+      attempt: 1,
       error: {
         code: 'STORED_FILE_INTEGRITY_FAILED',
         message: 'Stored file content did not match its recorded digest',
       },
     })
-    await expect(repository.listRequirements(tenantId, projectId, {})).resolves.toEqual([])
   })
 })
 
@@ -170,15 +180,15 @@ class CorruptingObjectStorage extends InMemoryObjectStorage {
   }
 }
 
-async function waitForRecoveredTask(
+async function waitForTerminalTask(
   repository: InMemoryBidRepository,
   tenantId: string,
   taskId: string,
 ) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     const task = await repository.findTask(tenantId, taskId)
     if (task?.status === 'succeeded' || task?.status === 'failed') return task
     await new Promise((resolve) => setTimeout(resolve, 2))
   }
-  throw new Error('Recovered task did not finish in time')
+  throw new Error('Task did not reach a terminal state')
 }

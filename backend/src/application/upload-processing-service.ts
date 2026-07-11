@@ -6,7 +6,7 @@ import type { FileContentLoader } from './file-content-loader.js'
 interface ProcessingErrorContext {
   tenantId: string
   taskId: string
-  stage: 'process' | 'persist-failure'
+  stage: 'process' | 'persist-failure' | 'lease-lost'
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -23,6 +23,9 @@ export class UploadProcessingService {
     private readonly fileContentLoader: FileContentLoader,
     private readonly parser: DevelopmentDocumentParser,
     private readonly delayMs: number,
+    private readonly workerId: string,
+    private readonly leaseMs: number,
+    private readonly maxAttempts: number,
     private readonly reportError: (error: unknown, context: ProcessingErrorContext) => void = () => undefined,
   ) {}
 
@@ -34,21 +37,8 @@ export class UploadProcessingService {
     }
     this.enqueuedTaskKeys.add(taskKey)
     const work = this.process(tenantId, taskId)
-      .catch(async (error: unknown) => {
+      .catch((error: unknown) => {
         this.reportError(error, { tenantId, taskId, stage: 'process' })
-        const code = error instanceof AppError ? error.code : 'DEVELOPMENT_PARSER_FAILED'
-        const message = error instanceof Error ? error.message : 'Unknown development parser failure'
-        try {
-          await this.repository.failTask(
-            tenantId,
-            taskId,
-            { code, message },
-            new Date().toISOString(),
-          )
-        } catch (persistenceError) {
-          // Keep the durable task state recoverable on the next single-instance startup.
-          this.reportError(persistenceError, { tenantId, taskId, stage: 'persist-failure' })
-        }
       })
       .finally(() => {
         this.pending.delete(work)
@@ -67,12 +57,51 @@ export class UploadProcessingService {
   private async process(tenantId: string, taskId: string): Promise<void> {
     await delay(this.delayMs)
     const startedAt = new Date().toISOString()
-    const task = await this.repository.markTaskRunning(tenantId, taskId, startedAt)
-    if (!task) return
-    const file = await this.fileContentLoader.loadForProcessing(tenantId, task.fileId)
-    if (!file) throw new Error('Uploaded file disappeared before development parsing')
-    const completedAt = new Date().toISOString()
-    const requirements = await this.parser.parse(file, task.id, completedAt)
-    await this.repository.completeTask(tenantId, task.id, requirements, completedAt)
+    const leaseExpiresAt = new Date(Date.parse(startedAt) + this.leaseMs).toISOString()
+    const claimed = await this.repository.claimTask(
+      tenantId,
+      taskId,
+      this.workerId,
+      startedAt,
+      leaseExpiresAt,
+      this.maxAttempts,
+    )
+    if (!claimed) return
+
+    try {
+      const file = await this.fileContentLoader.loadForProcessing(tenantId, claimed.task.fileId)
+      if (!file) throw new Error('Uploaded file disappeared before development parsing')
+      const completedAt = new Date().toISOString()
+      const requirements = await this.parser.parse(file, claimed.task.id, completedAt)
+      const completed = await this.repository.completeTask(claimed.lease, requirements, completedAt)
+      if (!completed) {
+        this.reportError(new Error('Development processor lost its task lease'), {
+          tenantId,
+          taskId,
+          stage: 'lease-lost',
+        })
+      }
+    } catch (error) {
+      this.reportError(error, { tenantId, taskId, stage: 'process' })
+      const code = error instanceof AppError ? error.code : 'DEVELOPMENT_PARSER_FAILED'
+      const message = error instanceof Error ? error.message : 'Unknown development parser failure'
+      try {
+        const failed = await this.repository.failTask(
+          claimed.lease,
+          { code, message },
+          new Date().toISOString(),
+          true,
+        )
+        if (!failed) {
+          this.reportError(new Error('Development processor lost its task lease'), {
+            tenantId,
+            taskId,
+            stage: 'lease-lost',
+          })
+        }
+      } catch (persistenceError) {
+        this.reportError(persistenceError, { tenantId, taskId, stage: 'persist-failure' })
+      }
+    }
   }
 }

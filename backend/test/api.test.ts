@@ -23,6 +23,19 @@ const config: AppConfig = {
   s3AccessKeyId: null,
   s3SecretAccessKey: null,
   s3ForcePathStyle: true,
+  redisUrl: null,
+  redisStreamKey: 'aibid:parse-tasks',
+  redisConsumerGroup: 'aibid-parser',
+  redisClaimIdleMs: 60_000,
+  workerId: null,
+  workerConcurrency: 2,
+  taskLeaseMs: 30_000,
+  taskHeartbeatMs: 10_000,
+  taskMaxAttempts: 3,
+  taskRetryBackoffMs: 1_000,
+  outboxPollIntervalMs: 250,
+  outboxLeaseMs: 10_000,
+  outboxBatchSize: 20,
   devTenantId: 'tenant-default',
   maxUploadBytes: 1024 * 1024,
   devParserDelayMs: 1,
@@ -84,6 +97,12 @@ class UploadFailingRepository extends InMemoryBidRepository {
   }
 }
 
+class PingFailingRepository extends InMemoryBidRepository {
+  override async ping(): Promise<void> {
+    throw Object.assign(new Error('simulated database outage'), { code: 'ECONNREFUSED' })
+  }
+}
+
 class CommitAcknowledgementLostRepository extends InMemoryBidRepository {
   override async createUpload(upload: NewUpload): Promise<{ file: ProjectFile; task: ParseTask }> {
     await super.createUpload(upload)
@@ -134,6 +153,28 @@ describe('AiBid API', () => {
       status: 503,
       code: 'OBJECT_STORAGE_UNAVAILABLE',
       detail: 'Object storage is temporarily unavailable',
+      requestId: expect.any(String),
+    })
+  })
+
+  it('reports repository outages as a stable RFC 7807 service error', async () => {
+    await app.close()
+    app = await buildApp({
+      config,
+      repository: new PingFailingRepository(),
+      objectStorage,
+    })
+
+    const response = await app.inject({ method: 'GET', url: '/health' })
+
+    expect(response.statusCode).toBe(503)
+    expect(response.headers['content-type']).toContain('application/problem+json')
+    expect(response.json()).toMatchObject({
+      type: 'https://aibid.dev/problems/database-unavailable',
+      title: 'Service Unavailable',
+      status: 503,
+      code: 'DATABASE_UNAVAILABLE',
+      detail: 'Database is temporarily unavailable',
       requestId: expect.any(String),
     })
   })

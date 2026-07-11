@@ -4,8 +4,9 @@ info:
   version: 0.1.0
   summary: AI 投标书 MVP 纵向切片 API
   description: |
-    AiBidV3 第一阶段开发契约，覆盖项目、文件上传、开发解析任务、
-    提取要求和人工确认。
+    AiBidV3 MVP 开发契约，覆盖项目、文件上传、可靠异步解析任务、
+    提取要求和人工确认。PostgreSQL 模式由独立 worker 执行任务，但当前
+    parser 仍只生成 development fixture，不代表真实 PDF/DOCX 解析。
 
     JSON 字段使用 camelCase。成功响应统一包裹在 `data` 中；错误响应
     使用 RFC 7807 `application/problem+json`。
@@ -255,8 +256,9 @@ paths:
       operationId: retryTask
       summary: 重试失败的解析任务
       description: |
-        仅 `failed` 任务可重试。服务端把同一任务恢复为 `queued` 并再次交给
-        开发解析适配器；其他状态返回 `TASK_NOT_RETRYABLE`。
+        仅 `failed` 任务可重试。服务端把同一任务恢复为 `queued` 并创建新的
+        outbox 投递事件；其他状态返回 `TASK_NOT_RETRYABLE`。默认内存模式仍
+        在 API 进程内调用开发解析适配器。
       responses:
         "202":
           description: 任务已重新排队
@@ -567,6 +569,7 @@ components:
         - type
         - status
         - progress
+        - attempt
         - error
         - createdAt
         - startedAt
@@ -582,13 +585,17 @@ components:
         type:
           type: string
           const: development-document-parse
-          description: 第一阶段开发适配器任务类型；真实 worker 接入时将版本化扩展
+          description: Phase C1 独立 worker 使用的开发适配器任务类型；Phase C2 接入真实 parser 时再版本化扩展
         status:
           $ref: "#/components/schemas/TaskStatus"
         progress:
           type: integer
           minimum: 0
           maximum: 100
+        attempt:
+          type: integer
+          minimum: 0
+          description: 当前自动重试周期内成功领取任务租约的次数；初始为 0，人工重试后重置
         error:
           oneOf:
             - $ref: "#/components/schemas/TaskError"
