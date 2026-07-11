@@ -1,7 +1,10 @@
 import { AppError } from '../src/lib/app-error.js'
-import { describe, expect, it } from 'vitest'
+import { Worker } from 'node:worker_threads'
+import { describe, expect, it, vi } from 'vitest'
 import { DurableTaskWorker } from '../src/application/durable-task-worker.js'
 import { OutboxRelay } from '../src/application/outbox-relay.js'
+import { UploadProcessingService } from '../src/application/upload-processing-service.js'
+import type { DocumentParser } from '../src/application/document-parser.js'
 import type { FileContentLoader } from '../src/application/file-content-loader.js'
 import type { DevelopmentDocumentParser } from '../src/application/development-document-parser.js'
 import type {
@@ -19,11 +22,21 @@ import type {
   TaskQueueDelivery,
   TaskQueuePayload,
 } from '../src/domain/task-queue.js'
+import { ParserError, type ParserFailureCode } from '../src/infrastructure/parser/parser-types.js'
+import { IsolatedDocumentParser } from '../src/infrastructure/parser/isolated-document-parser.js'
 import { RedisTaskQueue } from '../src/infrastructure/redis/redis-task-queue.js'
 
 const TENANT_ID = 'tenant-test'
 const TASK_ID = 'task-test'
 const FILE_ID = 'file-test'
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = (): void => undefined
+  const promise = new Promise<void>((complete) => {
+    resolve = complete
+  })
+  return { promise, resolve }
+}
 
 function task(overrides: Partial<ParseTask> = {}): ParseTask {
   const now = '2026-07-10T00:00:00.000Z'
@@ -68,6 +81,7 @@ function delivery(id = '1-0'): TaskQueueDelivery {
 class FakeQueue implements TaskQueue {
   readonly acknowledged: string[] = []
   readonly published: TaskQueuePayload[] = []
+  readonly pendingDeliveries: TaskQueueDelivery[] = []
   publishError: Error | null = null
 
   async connect(): Promise<void> {}
@@ -77,7 +91,7 @@ class FakeQueue implements TaskQueue {
     return `${this.published.length}-0`
   }
   async read(): Promise<TaskQueueDelivery[]> {
-    return []
+    return this.pendingDeliveries.splice(0)
   }
   async reclaim(): Promise<TaskQueueDelivery[]> {
     return []
@@ -120,6 +134,8 @@ class FakeWorkerRepository {
   activeToken: string | null = null
   allowClaim = true
   renewSucceeds = true
+  renewCount = 0
+  observeRenewal: ((count: number) => void) | null = null
   completeError: Error | null = null
   completedRequirements: Requirement[] | null = null
   requeued: { error: TaskError; availableAt: string } | null = null
@@ -171,6 +187,8 @@ class FakeWorkerRepository {
     _now: string,
     leaseExpiresAt: string,
   ): Promise<TaskLease | null> {
+    this.renewCount += 1
+    this.observeRenewal?.(this.renewCount)
     if (!this.renewSucceeds || lease.token !== this.activeToken) return null
     return { ...lease, expiresAt: leaseExpiresAt }
   }
@@ -255,9 +273,9 @@ function loader(load: () => Promise<StoredProjectFile | null>): FileContentLoade
 }
 
 function parser(
-  parse: () => Promise<Requirement[]> = async () => [],
-): DevelopmentDocumentParser {
-  return { parse } as DevelopmentDocumentParser
+  parse: DocumentParser['parse'] = async () => [],
+): DocumentParser {
+  return { parse }
 }
 
 function worker(
@@ -418,27 +436,371 @@ describe('DurableTaskWorker', () => {
     expect(queue.acknowledged).toEqual(['1-0'])
   })
 
-  it('does not mutate or ack after heartbeat renewal loses the lease', async () => {
+  it('passes the complete claimed task and an owned signal to the parser', async () => {
     const repository = new FakeWorkerRepository()
-    repository.renewSucceeds = false
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    let parsedTask: ParseTask | null = null
+    const parserState: { signal?: AbortSignal } = {}
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async (_file, claimedTask, _now, signal) => {
+        parsedTask = claimedTask
+        parserState.signal = signal
+        return []
+      }),
+    )
+
+    await durableWorker.processDelivery(delivery())
+
+    expect(parsedTask).toMatchObject({
+      id: TASK_ID,
+      type: 'document-parse-v1',
+      status: 'running',
+      attempt: 1,
+    })
+    expect(parserState.signal).toBeInstanceOf(AbortSignal)
+    expect(parserState.signal?.aborted).toBe(false)
+    expect(queue.acknowledged).toEqual(['1-0'])
+  })
+
+  it.each<[ParserFailureCode, string]>([
+    ['INVALID_PDF', 'PDF structure is malformed'],
+    ['DOCUMENT_PARSE_TIMEOUT', 'Document parsing exceeded its deadline'],
+    ['DOCUMENT_RESOURCE_LIMIT_EXCEEDED', 'Parser exceeded its heap limit'],
+    ['OCR_REQUIRED', 'PDF has no extractable text layer'],
+  ])('persists permanent parser error %s with its stable code', async (code, message) => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
     const queue = new FakeQueue()
     const durableWorker = worker(
       repository,
       queue,
       undefined,
       parser(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 20))
+        throw new ParserError(code, message)
+      }),
+    )
+
+    await durableWorker.processDelivery(delivery())
+
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toEqual({
+      error: { code, message },
+      deadLetter: true,
+    })
+    expect(queue.acknowledged).toEqual(['1-0'])
+  })
+
+  it('renews the lease while asynchronous parsing remains in flight', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const twoRenewalsObserved = deferred()
+    repository.observeRenewal = (count) => {
+      if (count >= 2) twoRenewalsObserved.resolve()
+    }
+    const queue = new FakeQueue()
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async () => {
+        await twoRenewalsObserved.promise
+        return []
+      }),
+      { leaseMs: 250, heartbeatMs: 10 },
+    )
+
+    await durableWorker.processDelivery(delivery())
+
+    expect(repository.renewCount).toBeGreaterThanOrEqual(2)
+    expect(repository.currentTask.status).toBe('succeeded')
+    expect(queue.acknowledged).toEqual(['1-0'])
+  }, 1_000)
+
+  it('renews the lease while an isolated parser worker is CPU-bound', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    const fixtureUrl = new URL('./fixtures/parser-worker-fixture.mjs', import.meta.url)
+    const cpuPhase = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+    let renewalsWhileCpuBound = 0
+    repository.observeRenewal = () => {
+      if (Atomics.load(cpuPhase, 0) === 1) renewalsWhileCpuBound += 1
+    }
+    const isolatedParser = new IsolatedDocumentParser({
+      timeoutMs: 2_000,
+      workerFactory: (_url, options) => new Worker(fixtureUrl, {
+        ...options,
+        workerData: {
+          ...options.workerData as object,
+          fixtureCpuPhase: cpuPhase.buffer,
+        },
+      }),
+    })
+    const cpuBoundFile = {
+      ...file(),
+      fileName: 'fixture-cpu.txt',
+      mediaType: 'text/plain',
+    }
+    const durableWorker = worker(
+      repository,
+      queue,
+      loader(async () => cpuBoundFile),
+      isolatedParser,
+      { leaseMs: 250, heartbeatMs: 10 },
+    )
+
+    await durableWorker.processDelivery(delivery())
+
+    expect(repository.renewCount).toBeGreaterThanOrEqual(2)
+    expect(renewalsWhileCpuBound).toBeGreaterThanOrEqual(2)
+    expect(repository.currentTask.status).toBe('succeeded')
+    expect(repository.completedRequirements).toHaveLength(1)
+    expect(repository.completedRequirements?.[0]?.title).toBe('CPU-bound fixture requirement')
+    expect(queue.acknowledged).toEqual(['1-0'])
+  }, 3_000)
+
+  it('terminates an isolated CPU-bound parser after lease loss without mutation or ack', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ id: 'fixture-hang', type: 'document-parse-v1' })
+    repository.renewSucceeds = false
+    const queue = new FakeQueue()
+    const childExited = deferred()
+    const fixtureUrl = new URL('./fixtures/parser-worker-fixture.mjs', import.meta.url)
+    const isolatedParser = new IsolatedDocumentParser({
+      timeoutMs: 2_000,
+      workerFactory: (_url, options) => {
+        const child = new Worker(fixtureUrl, options)
+        child.once('exit', () => childExited.resolve())
+        return child
+      },
+    })
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      isolatedParser,
+      { leaseMs: 30, heartbeatMs: 5 },
+    )
+
+    await durableWorker.processDelivery(delivery())
+    await childExited.promise
+
+    expect(repository.renewCount).toBeGreaterThanOrEqual(1)
+    expect(repository.currentTask.status).toBe('running')
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toBeNull()
+    expect(queue.acknowledged).toEqual([])
+  }, 3_000)
+
+  it('terminates an isolated CPU-bound parser on shutdown without mutation or ack', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ id: 'fixture-hang', type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    const shutdown = new AbortController()
+    const childOnline = deferred()
+    const childExited = deferred()
+    const fixtureUrl = new URL('./fixtures/parser-worker-fixture.mjs', import.meta.url)
+    const isolatedParser = new IsolatedDocumentParser({
+      timeoutMs: 2_000,
+      workerFactory: (_url, options) => {
+        const child = new Worker(fixtureUrl, options)
+        child.once('online', () => childOnline.resolve())
+        child.once('exit', () => childExited.resolve())
+        return child
+      },
+    })
+    const durableWorker = worker(repository, queue, undefined, isolatedParser)
+
+    const processing = durableWorker.processDelivery(delivery(), shutdown.signal)
+    await childOnline.promise
+    shutdown.abort()
+    await processing
+    await childExited.promise
+
+    expect(repository.currentTask.status).toBe('running')
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toBeNull()
+    expect(queue.acknowledged).toEqual([])
+  }, 3_000)
+
+  it('aborts the parser and does not mutate or ack after heartbeat renewal loses the lease', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    repository.renewSucceeds = false
+    const queue = new FakeQueue()
+    const parseStarted = deferred()
+    const parserState: { signal?: AbortSignal } = {}
+    let parserCleanupFinished = false
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async (_file, _task, _now, signal) => {
+        parserState.signal = signal
+        parseStarted.resolve()
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) => {
+            signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        parserCleanupFinished = true
+        signal.throwIfAborted()
         return []
       }),
       { leaseMs: 30, heartbeatMs: 5 },
     )
 
-    await durableWorker.processDelivery(delivery())
+    const processing = durableWorker.processDelivery(delivery())
+    await parseStarted.promise
+    await processing
 
+    expect(parserState.signal?.aborted).toBe(true)
+    expect(parserCleanupFinished).toBe(true)
+    expect(repository.currentTask.status).toBe('running')
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toBeNull()
+    expect(queue.acknowledged).toEqual([])
+  })
+
+  it('waits for parser cancellation on shutdown and performs no task mutation or ack', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    const shutdown = new AbortController()
+    const parseStarted = deferred()
+    const abortObserved = deferred()
+    const allowParserCleanup = deferred()
+    let parserCleanupFinished = false
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async (_file, _task, _now, signal) => {
+        parseStarted.resolve()
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) => {
+            signal.addEventListener('abort', () => resolve(), { once: true })
+          })
+        }
+        abortObserved.resolve()
+        await allowParserCleanup.promise
+        parserCleanupFinished = true
+        signal.throwIfAborted()
+        return []
+      }),
+    )
+
+    const processing = durableWorker.processDelivery(delivery(), shutdown.signal)
+    await parseStarted.promise
+    shutdown.abort()
+    const cancellationReachedParser = await Promise.race([
+      abortObserved.promise.then(() => true),
+      processing.then(() => false),
+    ])
+    expect(cancellationReachedParser).toBe(true)
+    let processingSettled = false
+    void processing.then(() => {
+      processingSettled = true
+    })
+    await Promise.resolve()
+
+    expect(processingSettled).toBe(false)
+    allowParserCleanup.resolve()
+    await processing
+    expect(parserCleanupFinished).toBe(true)
+    expect(repository.currentTask.status).toBe('running')
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toBeNull()
+    expect(queue.acknowledged).toEqual([])
+  })
+
+  it('propagates the run shutdown signal into scheduled deliveries', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    queue.pendingDeliveries.push(delivery())
+    const shutdown = new AbortController()
+    const parserState: { signal?: AbortSignal } = {}
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async (_file, _task, _now, signal) => {
+        parserState.signal = signal
+        shutdown.abort()
+        return []
+      }),
+    )
+
+    await durableWorker.run(shutdown.signal)
+
+    expect(parserState.signal?.aborted).toBe(true)
     expect(repository.currentTask.status).toBe('running')
     expect(repository.completedRequirements).toBeNull()
     expect(repository.failed).toBeNull()
     expect(queue.acknowledged).toEqual([])
+  })
+
+  it('blocks completion when shutdown aborts after parsing but before completion', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const queue = new FakeQueue()
+    const shutdown = new AbortController()
+    const durableWorker = worker(
+      repository,
+      queue,
+      undefined,
+      parser(async () => {
+        shutdown.abort()
+        return []
+      }),
+    )
+
+    await durableWorker.processDelivery(delivery(), shutdown.signal)
+
+    expect(repository.currentTask.status).toBe('running')
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.requeued).toBeNull()
+    expect(repository.failed).toBeNull()
+    expect(queue.acknowledged).toEqual([])
+  })
+})
+
+describe('UploadProcessingService', () => {
+  it('refuses to parse a real task in the development-only processor', async () => {
+    const repository = new FakeWorkerRepository()
+    repository.currentTask = task({ type: 'document-parse-v1' })
+    const loadForProcessing = vi.fn(async () => file())
+    const parse = vi.fn(async () => [])
+    const processor = new UploadProcessingService(
+      asRepository(repository),
+      loader(loadForProcessing),
+      { parse } as DevelopmentDocumentParser,
+      0,
+      'development-worker',
+      100,
+      3,
+    )
+
+    processor.enqueue(TENANT_ID, TASK_ID)
+    await processor.waitForIdle()
+
+    expect(loadForProcessing).not.toHaveBeenCalled()
+    expect(parse).not.toHaveBeenCalled()
+    expect(repository.completedRequirements).toBeNull()
+    expect(repository.failed).toMatchObject({
+      error: { code: 'DEVELOPMENT_PARSER_FAILED' },
+      deadLetter: true,
+    })
   })
 })
 

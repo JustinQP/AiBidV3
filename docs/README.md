@@ -6,11 +6,13 @@
 
 - [MVP 技术方案](MVP_TECHNICAL_DESIGN.md)：技术基线、系统边界、数据与租户模型、任务状态机、原文 locator、阶段计划与验收标准。
 - [ADR 0001：可靠任务交付](adr/0001-durable-task-delivery.md)：PostgreSQL outbox、Redis Streams consumer group、任务租约和 fencing 语义。
-- [OpenAPI 接口契约](api/openapi.yaml)：第一阶段项目、文件上传、解析任务、提取要求和人工确认接口。
+- [OpenAPI 接口契约](api/openapi.yaml)：项目、数字 PDF/DOCX/严格 UTF-8 TXT 上传、版本化解析任务、证据 locator、提取要求和人工确认接口。
 - [企业版 AI 投标书软件产品设计方案](PRODUCT_DESIGN.md)：产品范围、用户流程和高保真原型依据。
 - [本地部署说明](../deploy/README.md)：Fastify API、独立 worker、PostgreSQL、Redis 和 MinIO 的本地编排。
 - [前端原型说明](../frontend/README.md)：当前高保真原型的启动与验证。
 - [后端服务说明](../backend/README.md)：API 工程、配置与开发方式。
+
+当前已交付 C2.1：PostgreSQL 新任务通过隔离 Worker thread 执行数字 PDF/DOCX/TXT 解析并产出 `deterministic-rules-v1` 证据；默认内存模式和历史任务保留 `development-fixture`。扫描件/OCR、原件 viewer/download 与已验证高亮，以及生产准确率语料和量化 SLO 仍为后续范围。
 
 ## 文档职责
 

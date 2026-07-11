@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { Pool } from 'pg'
 import { DevelopmentDocumentParser } from '../../application/development-document-parser.js'
+import { DocumentParserRouter } from '../../application/document-parser.js'
 import { DurableTaskWorker } from '../../application/durable-task-worker.js'
 import { FileContentLoader } from '../../application/file-content-loader.js'
 import { OutboxRelay } from '../../application/outbox-relay.js'
@@ -10,6 +11,7 @@ import { originalObjectKey, type ObjectReference } from '../../domain/object-sto
 import type { TaskQueueDelivery } from '../../domain/task-queue.js'
 import { createId } from '../../lib/id.js'
 import { createObjectStorage } from '../object-storage-factory.js'
+import { IsolatedDocumentParser } from '../parser/isolated-document-parser.js'
 import { RedisTaskQueue } from '../redis/redis-task-queue.js'
 import { createRepository } from '../repository-factory.js'
 
@@ -30,7 +32,8 @@ const fileId = createId()
 const taskId = createId()
 const workerId = `worker-smoke:${smokeId}`
 const now = new Date().toISOString()
-const content = Buffer.from('durable worker integration smoke fixture')
+const requirementQuote = '投标人必须提交完整的技术实施方案。'
+const content = Buffer.from(`# 技术要求\n${requirementQuote}`, 'utf8')
 const file = {
   id: fileId,
   tenantId,
@@ -92,7 +95,7 @@ try {
       tenantId,
       projectId,
       fileId,
-      type: 'development-document-parse',
+      type: 'document-parse-v1',
       status: 'queued',
       progress: 0,
       attempt: 0,
@@ -120,7 +123,13 @@ try {
     repository,
     queue,
     new FileContentLoader(repository, objectStorage),
-    new DevelopmentDocumentParser(),
+    new DocumentParserRouter(
+      new DevelopmentDocumentParser(),
+      new IsolatedDocumentParser({
+        timeoutMs: config.parserTimeoutMs,
+        maxOldGenerationSizeMb: config.parserMaxOldGenerationSizeMb,
+      }),
+    ),
     {
       workerId,
       concurrency: 1,
@@ -141,7 +150,17 @@ try {
   await durableWorker.processDelivery(firstDelivery)
   const completed = await repository.findTask(tenantId, taskId)
   const requirements = await repository.listRequirements(tenantId, projectId, {})
-  if (completed?.status !== 'succeeded' || completed.attempt !== 1 || requirements.length !== 3) {
+  const requirement = requirements[0]
+  const locator = requirement?.sourceLocator
+  const expectedQuoteSha256 = createHash('sha256').update(requirementQuote).digest('hex')
+  if (completed?.status !== 'succeeded' || completed.attempt !== 1 || requirements.length !== 1 ||
+      requirement?.extractionMethod !== 'deterministic-rules-v1' ||
+      requirement.confidence !== 0.95 || requirement.description !== requirementQuote ||
+      locator?.kind !== 'txt' || locator.quote !== requirementQuote ||
+      locator.quoteSha256 !== expectedQuoteSha256 || locator.parserVersion !== 'deterministic-rules-v1' ||
+      locator.start.line !== 2 || locator.start.column !== 0 ||
+      locator.end.line !== 2 || locator.end.column !== requirementQuote.length ||
+      locator.sectionPath.length !== 1 || locator.sectionPath[0] !== '技术要求') {
     throw new Error('Worker smoke test did not durably complete the task with fenced effects')
   }
 

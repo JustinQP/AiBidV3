@@ -2,8 +2,11 @@ import type { TaskError, TaskLease } from '../domain/models.js'
 import type { BidRepository } from '../domain/repository.js'
 import type { TaskQueue, TaskQueueDelivery } from '../domain/task-queue.js'
 import { AppError } from '../lib/app-error.js'
-import type { DevelopmentDocumentParser } from './development-document-parser.js'
+import { ParserError } from '../infrastructure/parser/parser-types.js'
+import type { DocumentParser } from './document-parser.js'
 import type { FileContentLoader } from './file-content-loader.js'
+
+const NEVER_ABORTED_SIGNAL = new AbortController().signal
 
 export interface DurableTaskWorkerOptions {
   workerId: string
@@ -30,6 +33,7 @@ interface Heartbeat {
 }
 
 function taskError(error: unknown): TaskError {
+  if (error instanceof ParserError) return { code: error.code, message: error.message }
   if (error instanceof AppError) return { code: error.code, message: error.message }
   if (error instanceof Error) return { code: 'DEVELOPMENT_PARSER_FAILED', message: error.message }
   return { code: 'DEVELOPMENT_PARSER_FAILED', message: 'Unknown development parser failure' }
@@ -69,7 +73,7 @@ export class DurableTaskWorker {
     private readonly repository: BidRepository,
     private readonly queue: TaskQueue,
     private readonly fileContentLoader: FileContentLoader,
-    private readonly parser: DevelopmentDocumentParser,
+    private readonly parser: DocumentParser,
     private readonly options: DurableTaskWorkerOptions,
     private readonly reportError: (
       error: unknown,
@@ -112,13 +116,20 @@ export class DurableTaskWorker {
         continue
       }
 
-      for (const delivery of deliveries.slice(0, capacity)) this.schedule(delivery)
+      for (const delivery of deliveries.slice(0, capacity)) {
+        if (signal.aborted) break
+        this.schedule(delivery, signal)
+      }
     }
     await Promise.allSettled([...this.inFlight])
   }
 
   /** One delivery hook used by deterministic tests and one-shot smoke checks. */
-  async processDelivery(delivery: TaskQueueDelivery): Promise<void> {
+  async processDelivery(
+    delivery: TaskQueueDelivery,
+    shutdownSignal: AbortSignal = NEVER_ABORTED_SIGNAL,
+  ): Promise<void> {
+    if (shutdownSignal.aborted) return
     const context = {
       deliveryId: delivery.deliveryId,
       tenantId: delivery.tenantId,
@@ -136,7 +147,7 @@ export class DurableTaskWorker {
         this.options.maxAttempts,
       )
     } catch (error) {
-      this.reportError(error, { stage: 'claim', ...context })
+      if (!shutdownSignal.aborted) this.reportError(error, { stage: 'claim', ...context })
       return
     }
 
@@ -145,19 +156,36 @@ export class DurableTaskWorker {
       // Terminal and deleted tasks can never become executable. A queued task or
       // a running task with another valid lease must remain pending for reclaim.
       if (!task || task.status === 'succeeded' || task.status === 'failed') {
-        await this.acknowledge(delivery)
+        if (!shutdownSignal.aborted) await this.acknowledge(delivery)
       }
       return
     }
 
-    const heartbeat = this.startHeartbeat(claimed.lease, context)
+    const deliveryController = new AbortController()
+    const abortDelivery = (reason: unknown): void => {
+      if (!deliveryController.signal.aborted) deliveryController.abort(reason)
+    }
+    const abortForShutdown = (): void => abortDelivery(shutdownSignal.reason)
+    if (shutdownSignal.aborted) abortForShutdown()
+    else shutdownSignal.addEventListener('abort', abortForShutdown, { once: true })
+
+    const heartbeat = this.startHeartbeat(
+      claimed.lease,
+      context,
+      () => abortDelivery(new Error('Task lease was lost')),
+    )
+    const intentionallyAborted = (): boolean =>
+      shutdownSignal.aborted || deliveryController.signal.aborted || heartbeat.leaseLost()
+
     try {
       let requirements
       try {
+        if (intentionallyAborted()) return
         const file = await this.fileContentLoader.loadForProcessing(
           delivery.tenantId,
           claimed.task.fileId,
         )
+        if (intentionallyAborted()) return
         if (!file) {
           throw new AppError(
             500,
@@ -167,11 +195,16 @@ export class DurableTaskWorker {
           )
         }
         const parsedAt = new Date().toISOString()
-        requirements = await this.parser.parse(file, claimed.task.id, parsedAt)
+        requirements = await this.parser.parse(
+          file,
+          claimed.task,
+          parsedAt,
+          deliveryController.signal,
+        )
       } catch (error) {
-        this.reportError(error, { stage: 'process', ...context })
         await heartbeat.stop()
-        if (heartbeat.leaseLost()) return
+        if (intentionallyAborted()) return
+        this.reportError(error, { stage: 'process', ...context })
 
         const failedAt = new Date()
         const normalized = taskError(error)
@@ -181,65 +214,83 @@ export class DurableTaskWorker {
             const retryAt = new Date(
               failedAt.getTime() + this.options.retryBackoffMs * 2 ** exponent,
             ).toISOString()
+            if (intentionallyAborted()) return
             const requeued = await this.repository.requeueTask(
               heartbeat.currentLease(),
               normalized,
               failedAt.toISOString(),
               retryAt,
             )
-            if (requeued) await this.acknowledge(delivery)
-            else this.reportError(new Error('Task retry transition was rejected'), {
-              stage: 'transition',
-              ...context,
-            })
+            if (intentionallyAborted()) return
+            if (requeued) {
+              if (!intentionallyAborted()) await this.acknowledge(delivery)
+            } else {
+              this.reportError(new Error('Task retry transition was rejected'), {
+                stage: 'transition',
+                ...context,
+              })
+            }
             return
           }
 
+          if (intentionallyAborted()) return
           const failed = await this.repository.failTask(
             heartbeat.currentLease(),
             normalized,
             failedAt.toISOString(),
             true,
           )
-          if (failed) await this.acknowledge(delivery)
-          else this.reportError(new Error('Task failure transition was rejected'), {
-            stage: 'transition',
-            ...context,
-          })
+          if (intentionallyAborted()) return
+          if (failed) {
+            if (!intentionallyAborted()) await this.acknowledge(delivery)
+          } else {
+            this.reportError(new Error('Task failure transition was rejected'), {
+              stage: 'transition',
+              ...context,
+            })
+          }
         } catch (transitionError) {
           // The transaction outcome may be ambiguous. Leave the notification
           // pending so a later fenced claim can reconcile the database state.
-          this.reportError(transitionError, { stage: 'transition', ...context })
+          if (!intentionallyAborted()) {
+            this.reportError(transitionError, { stage: 'transition', ...context })
+          }
         }
         return
       }
 
       await heartbeat.stop()
-      if (heartbeat.leaseLost()) return
+      if (intentionallyAborted()) return
       const completedAt = new Date().toISOString()
       try {
+        if (intentionallyAborted()) return
         const completed = await this.repository.completeTask(
           heartbeat.currentLease(),
           requirements,
           completedAt,
         )
-        if (completed) await this.acknowledge(delivery)
-        else this.reportError(new Error('Task completion was rejected'), {
-          stage: 'complete',
-          ...context,
-        })
+        if (intentionallyAborted()) return
+        if (completed) {
+          if (!intentionallyAborted()) await this.acknowledge(delivery)
+        } else {
+          this.reportError(new Error('Task completion was rejected'), {
+            stage: 'complete',
+            ...context,
+          })
+        }
       } catch (error) {
         // Never turn an ambiguous completion into a failure. A committed result
         // may merely have lost its acknowledgement; redelivery will reconcile it.
-        this.reportError(error, { stage: 'complete', ...context })
+        if (!intentionallyAborted()) this.reportError(error, { stage: 'complete', ...context })
       }
     } finally {
+      shutdownSignal.removeEventListener('abort', abortForShutdown)
       await heartbeat.stop()
     }
   }
 
-  private schedule(delivery: TaskQueueDelivery): void {
-    const work = this.processDelivery(delivery)
+  private schedule(delivery: TaskQueueDelivery, shutdownSignal: AbortSignal): void {
+    const work = this.processDelivery(delivery, shutdownSignal)
       .catch((error: unknown) => {
         this.reportError(error, {
           stage: 'process',
@@ -268,6 +319,7 @@ export class DurableTaskWorker {
   private startHeartbeat(
     initialLease: TaskLease,
     context: Omit<DurableTaskWorkerErrorContext, 'stage'>,
+    onLeaseLost: () => void,
   ): Heartbeat {
     let lease = initialLease
     let lost = false
@@ -287,6 +339,7 @@ export class DurableTaskWorker {
           )
           if (!renewed) {
             lost = true
+            onLeaseLost()
             this.reportError(new Error('Task lease renewal was rejected'), {
               stage: 'heartbeat',
               ...context,
@@ -296,6 +349,7 @@ export class DurableTaskWorker {
           // Conservatively stop mutation/acknowledgement. The database token
           // fences this worker even if the lease is later claimed elsewhere.
           lost = true
+          onLeaseLost()
           this.reportError(error, { stage: 'heartbeat', ...context })
         }
         if (!stopped && !lost) timer = setTimeout(tick, this.options.heartbeatMs)

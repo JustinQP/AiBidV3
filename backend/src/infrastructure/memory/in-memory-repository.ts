@@ -15,6 +15,7 @@ import type {
   TaskOutboxEvent,
 } from '../../domain/models.js'
 import type { BidRepository } from '../../domain/repository.js'
+import { validateRequirementEvidence } from '../../domain/source-locator.js'
 import { createId } from '../../lib/id.js'
 
 interface InMemoryOutboxEvent {
@@ -48,6 +49,25 @@ function publicFile(file: ProjectFile): ProjectFile {
     parseStatus: file.parseStatus,
     createdAt: file.createdAt,
     updatedAt: file.updatedAt,
+  }
+}
+
+function validatedRequirement(
+  requirement: Requirement,
+  file: StoredProjectFileRecord,
+  task: ParseTask,
+): Requirement {
+  const evidence = validateRequirementEvidence(requirement, {
+    expectedSourceFileId: file.id,
+    expectedSourceFileName: file.fileName,
+    expectedSourceSha256: file.sha256,
+    expectedSourceMediaType: file.mediaType,
+    expectedTaskType: task.type,
+  })
+  return {
+    ...requirement,
+    ...evidence,
+    sourceLocator: structuredClone(evidence.sourceLocator),
   }
 }
 
@@ -238,6 +258,15 @@ export class InMemoryBidRepository implements BidRepository {
   ): Promise<ParseTask | null> {
     const task = this.tasks.get(lease.taskId)
     if (task?.tenantId !== lease.tenantId || !this.hasValidLease(lease, now)) return null
+    const file = this.files.get(task.fileId)
+    if (
+      file?.tenantId !== lease.tenantId ||
+      file.projectId !== task.projectId ||
+      file.id !== task.fileId
+    ) {
+      throw new Error('Cannot complete a task without its stored source file')
+    }
+    const validatedRequirements: Requirement[] = []
     for (const requirement of requirements) {
       if (
         requirement.tenantId !== lease.tenantId ||
@@ -247,9 +276,10 @@ export class InMemoryBidRepository implements BidRepository {
       ) {
         throw new Error('Cannot persist a requirement outside its task boundary')
       }
+      validatedRequirements.push(validatedRequirement(requirement, file, task))
     }
-    for (const requirement of requirements) {
-      this.requirements.set(requirement.id, { ...requirement })
+    for (const requirement of validatedRequirements) {
+      this.requirements.set(requirement.id, requirement)
     }
     const updated: ParseTask = {
       ...task,
@@ -261,8 +291,7 @@ export class InMemoryBidRepository implements BidRepository {
     }
     this.tasks.set(lease.taskId, updated)
     this.taskLeases.delete(lease.taskId)
-    const file = this.files.get(task.fileId)
-    if (file?.tenantId === lease.tenantId) {
+    if (file.tenantId === lease.tenantId) {
       this.files.set(file.id, { ...file, parseStatus: 'parsed', updatedAt: now })
     }
     return cloneTask(updated)
@@ -445,10 +474,12 @@ export class InMemoryBidRepository implements BidRepository {
           (filters.priority === undefined || requirement.priority === filters.priority),
       )
       .sort((left, right) => left.code.localeCompare(right.code))
-      .map((requirement) => ({
-        ...requirement,
-        sourceLocator: { ...requirement.sourceLocator, sectionPath: [...requirement.sourceLocator.sectionPath] },
-      }))
+      .map((requirement) => {
+        const file = this.files.get(requirement.fileId)
+        const task = this.tasks.get(requirement.taskId)
+        if (!file || !task) throw new Error('Persisted requirement lineage is incomplete')
+        return validatedRequirement(requirement, file, task)
+      })
   }
 
   async confirmRequirement(
@@ -459,18 +490,20 @@ export class InMemoryBidRepository implements BidRepository {
   ): Promise<Requirement | null> {
     const requirement = this.requirements.get(requirementId)
     if (requirement?.tenantId !== tenantId || requirement.projectId !== projectId) return null
+    const file = this.files.get(requirement.fileId)
+    const task = this.tasks.get(requirement.taskId)
+    if (!file || !task) throw new Error('Persisted requirement lineage is incomplete')
+    const persisted = validatedRequirement(requirement, file, task)
     const updated: Requirement = {
-      ...requirement,
+      ...persisted,
       confirmationStatus: confirmation.status,
       confirmationNote: confirmation.note,
       confirmedAt: confirmation.confirmedAt,
       updatedAt: confirmation.confirmedAt,
     }
-    this.requirements.set(requirementId, updated)
-    return {
-      ...updated,
-      sourceLocator: { ...updated.sourceLocator, sectionPath: [...updated.sourceLocator.sectionPath] },
-    }
+    const validated = validatedRequirement(updated, file, task)
+    this.requirements.set(requirementId, validated)
+    return validatedRequirement(validated, file, task)
   }
 
   private hasValidLease(lease: TaskLease, now: string): boolean {

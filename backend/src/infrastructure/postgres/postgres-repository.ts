@@ -3,11 +3,11 @@ import type { Pool, PoolClient, QueryResultRow } from 'pg'
 import type {
   ClaimedTask,
   ConfirmationStatus,
-  DevelopmentSourceLocator,
   FileParseStatus,
   NewProject,
   NewUpload,
   ParseTask,
+  ParseTaskType,
   Project,
   ProjectFile,
   ProjectStatus,
@@ -24,6 +24,7 @@ import type {
 } from '../../domain/models.js'
 import type { BidRepository } from '../../domain/repository.js'
 import { isOriginalObjectKeyWithinBoundary } from '../../domain/object-storage.js'
+import { validateRequirementEvidence } from '../../domain/source-locator.js'
 import { AppError } from '../../lib/app-error.js'
 import { createId } from '../../lib/id.js'
 
@@ -63,7 +64,7 @@ interface TaskRow extends QueryResultRow {
   tenant_id: string
   project_id: string
   file_id: string
-  type: 'development-document-parse'
+  type: ParseTaskType
   status: TaskStatus
   progress: number
   attempt: number
@@ -77,6 +78,13 @@ interface TaskRow extends QueryResultRow {
   lease_owner: string | null
   lease_expires_at: Date | string | null
   dead_lettered_at: Date | string | null
+}
+
+interface LockedTaskRow extends TaskRow {
+  source_file_id: string
+  source_file_name: string
+  source_file_sha256: string
+  source_file_media_type: string
 }
 
 interface OutboxRow extends QueryResultRow {
@@ -101,8 +109,13 @@ interface RequirementRow extends QueryResultRow {
   confirmation_status: ConfirmationStatus
   confirmation_note: string | null
   confirmed_at: Date | string | null
-  extraction_method: 'development-fixture'
-  source_locator: DevelopmentSourceLocator
+  extraction_method: unknown
+  confidence: string | number | null
+  source_locator: unknown
+  source_file_name: string
+  source_file_sha256: string
+  source_file_media_type: string
+  source_task_type: unknown
   created_at: Date | string
   updated_at: Date | string
 }
@@ -174,6 +187,22 @@ function mapOutboxEvent(row: OutboxRow): TaskOutboxEvent {
 }
 
 function mapRequirement(row: RequirementRow): Requirement {
+  const confidence =
+    typeof row.confidence === 'string' ? Number(row.confidence) : row.confidence
+  const evidence = validateRequirementEvidence(
+    {
+      extractionMethod: row.extraction_method,
+      confidence,
+      sourceLocator: row.source_locator,
+    },
+    {
+      expectedSourceFileId: row.file_id,
+      expectedSourceFileName: row.source_file_name,
+      expectedSourceSha256: row.source_file_sha256,
+      expectedSourceMediaType: row.source_file_media_type,
+      expectedTaskType: row.source_task_type,
+    },
+  )
   return {
     id: row.id,
     tenantId: row.tenant_id,
@@ -188,8 +217,9 @@ function mapRequirement(row: RequirementRow): Requirement {
     confirmationStatus: row.confirmation_status,
     confirmationNote: row.confirmation_note,
     confirmedAt: nullableTimestamp(row.confirmed_at),
-    extractionMethod: row.extraction_method,
-    sourceLocator: row.source_locator,
+    extractionMethod: evidence.extractionMethod,
+    confidence: evidence.confidence,
+    sourceLocator: evidence.sourceLocator,
     createdAt: timestamp(row.created_at),
     updatedAt: timestamp(row.updated_at),
   }
@@ -491,15 +521,24 @@ export class PostgresBidRepository implements BidRepository {
     now: string,
   ): Promise<ParseTask | null> {
     return this.withTransaction(async (client) => {
-      const locked = await client.query<TaskRow>(
-        `SELECT * FROM parse_tasks
-        WHERE tenant_id = $1
-          AND id = $2
-          AND status = 'running'
-          AND lease_owner = $3
-          AND lease_token = $4
-          AND lease_expires_at > clock_timestamp()
-        FOR UPDATE`,
+      const locked = await client.query<LockedTaskRow>(
+        `SELECT task.*,
+          file.id AS source_file_id,
+          file.file_name AS source_file_name,
+          file.sha256 AS source_file_sha256,
+          file.media_type AS source_file_media_type
+        FROM parse_tasks AS task
+        JOIN project_files AS file
+          ON file.tenant_id = task.tenant_id
+          AND file.project_id = task.project_id
+          AND file.id = task.file_id
+        WHERE task.tenant_id = $1
+          AND task.id = $2
+          AND task.status = 'running'
+          AND task.lease_owner = $3
+          AND task.lease_token = $4
+          AND task.lease_expires_at > clock_timestamp()
+        FOR UPDATE OF task, file`,
         [lease.tenantId, lease.taskId, lease.workerId, lease.token],
       )
       const task = locked.rows[0]
@@ -514,12 +553,19 @@ export class PostgresBidRepository implements BidRepository {
         ) {
           throw new Error('Cannot persist a requirement outside its task boundary')
         }
+        const evidence = validateRequirementEvidence(requirement, {
+          expectedSourceFileId: task.source_file_id,
+          expectedSourceFileName: task.source_file_name,
+          expectedSourceSha256: task.source_file_sha256,
+          expectedSourceMediaType: task.source_file_media_type,
+          expectedTaskType: task.type,
+        })
         await client.query(
           `INSERT INTO requirements (
             id, tenant_id, project_id, file_id, task_id, code, title, description,
             category, priority, confirmation_status, confirmation_note, confirmed_at,
-            extraction_method, source_locator, created_at, updated_at
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+            extraction_method, confidence, source_locator, created_at, updated_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
           [
             requirement.id,
             requirement.tenantId,
@@ -534,8 +580,9 @@ export class PostgresBidRepository implements BidRepository {
             requirement.confirmationStatus,
             requirement.confirmationNote,
             requirement.confirmedAt,
-            requirement.extractionMethod,
-            JSON.stringify(requirement.sourceLocator),
+            evidence.extractionMethod,
+            evidence.confidence,
+            JSON.stringify(evidence.sourceLocator),
             requirement.createdAt,
             requirement.updatedAt,
           ],
@@ -762,18 +809,34 @@ export class PostgresBidRepository implements BidRepository {
     projectId: string,
     filters: RequirementFilters,
   ): Promise<Requirement[]> {
-    const clauses = ['tenant_id = $1', 'project_id = $2']
+    const clauses = ['requirement.tenant_id = $1', 'requirement.project_id = $2']
     const values: unknown[] = [tenantId, projectId]
     if (filters.confirmationStatus !== undefined) {
       values.push(filters.confirmationStatus)
-      clauses.push(`confirmation_status = $${values.length}`)
+      clauses.push(`requirement.confirmation_status = $${values.length}`)
     }
     if (filters.priority !== undefined) {
       values.push(filters.priority)
-      clauses.push(`priority = $${values.length}`)
+      clauses.push(`requirement.priority = $${values.length}`)
     }
     const result = await this.pool.query<RequirementRow>(
-      `SELECT * FROM requirements WHERE ${clauses.join(' AND ')} ORDER BY code`,
+      `SELECT requirement.*,
+        file.file_name AS source_file_name,
+        file.sha256 AS source_file_sha256,
+        file.media_type AS source_file_media_type,
+        task.type AS source_task_type
+      FROM requirements AS requirement
+      JOIN project_files AS file
+        ON file.tenant_id = requirement.tenant_id
+        AND file.project_id = requirement.project_id
+        AND file.id = requirement.file_id
+      JOIN parse_tasks AS task
+        ON task.tenant_id = requirement.tenant_id
+        AND task.project_id = requirement.project_id
+        AND task.file_id = requirement.file_id
+        AND task.id = requirement.task_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY requirement.code`,
       values,
     )
     return result.rows.map(mapRequirement)
@@ -786,10 +849,27 @@ export class PostgresBidRepository implements BidRepository {
     confirmation: RequirementConfirmation,
   ): Promise<Requirement | null> {
     const result = await this.pool.query<RequirementRow>(
-      `UPDATE requirements
-      SET confirmation_status = $4, confirmation_note = $5, confirmed_at = $6, updated_at = $6
-      WHERE tenant_id = $1 AND project_id = $2 AND id = $3
-      RETURNING *`,
+      `WITH updated AS (
+        UPDATE requirements
+        SET confirmation_status = $4, confirmation_note = $5, confirmed_at = $6, updated_at = $6
+        WHERE tenant_id = $1 AND project_id = $2 AND id = $3
+        RETURNING *
+      )
+      SELECT updated.*,
+        file.file_name AS source_file_name,
+        file.sha256 AS source_file_sha256,
+        file.media_type AS source_file_media_type,
+        task.type AS source_task_type
+      FROM updated
+      JOIN project_files AS file
+        ON file.tenant_id = updated.tenant_id
+        AND file.project_id = updated.project_id
+        AND file.id = updated.file_id
+      JOIN parse_tasks AS task
+        ON task.tenant_id = updated.tenant_id
+        AND task.project_id = updated.project_id
+        AND task.file_id = updated.file_id
+        AND task.id = updated.task_id`,
       [
         tenantId,
         projectId,

@@ -50,6 +50,29 @@ export interface ProjectFileItem {
   canRetry: boolean
 }
 
+interface RequirementEvidenceBase {
+  label: string
+  anchorLabel: string
+  anchorDetails: string[]
+  verified: false
+}
+
+export type RequirementEvidence =
+  | (RequirementEvidenceBase & {
+      kind: 'mock-preview' | 'development-fixture'
+      sourceRevision: null
+      parserVersion: null
+      quoteSha256: null
+      sourceSha256: null
+    })
+  | (RequirementEvidenceBase & {
+      kind: 'pdf' | 'docx' | 'txt'
+      sourceRevision: 1
+      parserVersion: string
+      quoteSha256: string
+      sourceSha256: string
+    })
+
 export interface RequirementListItem {
   /** Stable backend resource identifier used by mutations. */
   id: string
@@ -73,6 +96,7 @@ export interface RequirementListItem {
   confirmationNote: string | null
   priority: RequirementPriority
   score: number | null
+  evidence: RequirementEvidence
 }
 
 interface MockProjectSummary {
@@ -135,6 +159,134 @@ function statusFromConfirmation(status: RequirementConfirmationStatus): Requirem
   if (status === 'confirmed') return '待响应'
   if (status === 'rejected') return '已驳回'
   return '未确认'
+}
+
+interface AdaptedRequirementSource {
+  source: string
+  page: number | null
+  sectionPath: string[]
+  sourceQuote: string
+  evidence: RequirementEvidence
+}
+
+function adaptRequirementSource(
+  locator: RequirementRecord['sourceLocator'],
+): AdaptedRequirementSource {
+  switch (locator.kind) {
+    case 'development-fixture': {
+      const anchorLabel = locator.sectionPath.at(-1) ?? '未提供原文锚点'
+      return {
+        source: locator.fileName,
+        page: locator.pageNumber,
+        sectionPath: locator.sectionPath,
+        sourceQuote: locator.quote,
+        evidence: {
+          kind: 'development-fixture',
+          label: '开发夹具',
+          sourceRevision: null,
+          parserVersion: null,
+          anchorLabel,
+          anchorDetails: locator.sectionPath.length === 0
+            ? []
+            : [`章节：${locator.sectionPath.join(' / ')}`],
+          quoteSha256: null,
+          sourceSha256: null,
+          verified: false,
+        },
+      }
+    }
+    case 'pdf': {
+      const firstRegion = locator.regions[0]
+      if (firstRegion === undefined) throw new Error('PDF evidence requires at least one region')
+      return {
+        source: locator.sourceFileName,
+        page: firstRegion.page,
+        sectionPath: locator.sectionPath,
+        sourceQuote: locator.quote,
+        evidence: {
+          kind: 'pdf',
+          label: 'PDF',
+          sourceRevision: locator.sourceRevision,
+          parserVersion: locator.parserVersion,
+          anchorLabel: `第 ${firstRegion.page} 页`,
+          anchorDetails: locator.regions.map((region, index) =>
+            `区域 ${index + 1}：第 ${region.page} 页 · x ${region.bbox.x} · y ${region.bbox.y} · 宽 ${region.bbox.width} · 高 ${region.bbox.height}`,
+          ),
+          quoteSha256: locator.quoteSha256,
+          sourceSha256: locator.sourceSha256,
+          verified: false,
+        },
+      }
+    }
+    case 'docx': {
+      const firstRange = locator.ranges[0]
+      if (firstRange === undefined) throw new Error('DOCX evidence requires at least one range')
+      const anchorLabel = firstRange.paragraphId === null
+        ? `段落索引 ${firstRange.paragraphIndex}`
+        : `段落 ${firstRange.paragraphId}`
+      return {
+        source: locator.sourceFileName,
+        page: null,
+        sectionPath: locator.sectionPath,
+        sourceQuote: locator.quote,
+        evidence: {
+          kind: 'docx',
+          label: 'DOCX',
+          sourceRevision: locator.sourceRevision,
+          parserVersion: locator.parserVersion,
+          anchorLabel,
+          anchorDetails: locator.ranges.map((range, index) => {
+            const paragraph = range.paragraphId === null
+              ? `段落索引 ${range.paragraphIndex}`
+              : `段落 ${range.paragraphId} · 段落索引 ${range.paragraphIndex}`
+            const tablePath = range.tablePath
+              .map((entry) =>
+                `表格 ${entry.tableIndex} / 行 ${entry.rowIndex} / 单元格 ${entry.cellIndex}`,
+              )
+              .join(' > ')
+            return `范围 ${index + 1}：${paragraph} · 字符 ${range.charStart}–${range.charEnd}${
+              tablePath.length === 0 ? '' : ` · ${tablePath}`
+            }`
+          }),
+          quoteSha256: locator.quoteSha256,
+          sourceSha256: locator.sourceSha256,
+          verified: false,
+        },
+      }
+    }
+    case 'txt':
+      return {
+        source: locator.sourceFileName,
+        page: null,
+        sectionPath: locator.sectionPath,
+        sourceQuote: locator.quote,
+        evidence: {
+          kind: 'txt',
+          label: 'TXT',
+          sourceRevision: locator.sourceRevision,
+          parserVersion: locator.parserVersion,
+          anchorLabel: `第 ${locator.start.line} 行`,
+          anchorDetails: [
+            `起点 ${locator.start.line}:${locator.start.column}`,
+            `终点 ${locator.end.line}:${locator.end.column}（不含）`,
+          ],
+          quoteSha256: locator.quoteSha256,
+          sourceSha256: locator.sourceSha256,
+          verified: false,
+        },
+      }
+    default:
+      return assertNever(locator)
+  }
+}
+
+function confidencePercent(requirement: RequirementRecord): number | null {
+  if (requirement.sourceLocator.kind === 'development-fixture') return null
+  return requirement.confidence === null ? null : Math.round(requirement.confidence * 100)
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unsupported source locator: ${String(value)}`)
 }
 
 function newestTaskByFile(tasks: ProcessingTask[]): Map<string, ProcessingTask> {
@@ -261,18 +413,19 @@ export function adaptMockProjectFiles(files: BidFile[]): ProjectFileItem[] {
 }
 
 export function adaptApiRequirement(requirement: RequirementRecord): RequirementListItem {
+  const source = adaptRequirementSource(requirement.sourceLocator)
   return {
     id: requirement.id,
     code: requirement.code,
     title: requirement.title,
     summary: requirement.description,
     type: typeFromCategory(requirement.category),
-    source: requirement.sourceLocator.fileName,
-    page: requirement.sourceLocator.pageNumber,
-    sectionPath: requirement.sourceLocator.sectionPath,
-    sourceQuote: requirement.sourceLocator.quote,
+    source: source.source,
+    page: source.page,
+    sectionPath: source.sectionPath,
+    sourceQuote: source.sourceQuote,
     mandatory: requirement.priority === 'mandatory',
-    confidence: null,
+    confidence: confidencePercent(requirement),
     owner: null,
     section: null,
     risk: null,
@@ -282,6 +435,7 @@ export function adaptApiRequirement(requirement: RequirementRecord): Requirement
     confirmationNote: requirement.confirmationNote,
     priority: requirement.priority,
     score: null,
+    evidence: source.evidence,
   }
 }
 
@@ -307,5 +461,16 @@ export function adaptMockRequirement(requirement: Requirement): RequirementListI
     confirmationNote: null,
     priority: requirement.mandatory ? 'mandatory' : 'normal',
     score: requirement.score ?? null,
+    evidence: {
+      kind: 'mock-preview',
+      label: '模拟预览',
+      sourceRevision: null,
+      parserVersion: null,
+      anchorLabel: `第 ${requirement.page} 页`,
+      anchorDetails: ['模拟来源定位'],
+      quoteSha256: null,
+      sourceSha256: null,
+      verified: false,
+    },
   }
 }

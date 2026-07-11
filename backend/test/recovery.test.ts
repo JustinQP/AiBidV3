@@ -33,6 +33,8 @@ const config: AppConfig = {
   redisClaimIdleMs: 60_000,
   workerId: null,
   workerConcurrency: 2,
+  parserTimeoutMs: 60_000,
+  parserMaxOldGenerationSizeMb: 256,
   taskLeaseMs: 30_000,
   taskHeartbeatMs: 10_000,
   taskMaxAttempts: 3,
@@ -121,6 +123,59 @@ describe('task execution boundaries', () => {
     })
   })
 
+  it.each(['pdf', 'docx', 'txt'])(
+    'routes new PostgreSQL-mode .%s uploads to the real parser worker task',
+    async (extension) => {
+      const repository = new InMemoryBidRepository()
+      const objectStorage = new InMemoryObjectStorage()
+      const tenantId = `tenant-postgres-${extension}`
+      const projectId = createId()
+      const now = new Date().toISOString()
+      await repository.createProject({
+        id: projectId,
+        tenantId,
+        name: `PostgreSQL ${extension} 上传路由`,
+        code: null,
+        customerName: null,
+        ownerName: null,
+        deadline: null,
+        status: 'draft',
+        createdAt: now,
+        updatedAt: now,
+      })
+      app = await buildApp({
+        config: {
+          ...config,
+          repositoryDriver: 'postgres',
+          databaseUrl: 'postgresql://injected-repository',
+          objectStorageDriver: 's3',
+          s3Bucket: 'injected-storage',
+        },
+        repository,
+        objectStorage,
+      })
+
+      const response = await uploadFile(app, tenantId, projectId, `requirements.${extension}`)
+
+      expect(response.statusCode).toBe(202)
+      const task = response.json<{
+        data: { task: { id: string; type: string; status: string; attempt: number } }
+      }>().data.task
+      expect(task).toMatchObject({
+        type: 'document-parse-v1',
+        status: 'queued',
+        attempt: 0,
+      })
+      await app.close()
+      app = undefined
+      await expect(repository.findTask(tenantId, task.id)).resolves.toMatchObject({
+        type: 'document-parse-v1',
+        status: 'queued',
+        attempt: 0,
+      })
+    },
+  )
+
   it('keeps the zero-dependency memory mode interactive and fails corrupted content safely', async () => {
     const repository = new InMemoryBidRepository()
     const objectStorage = new CorruptingObjectStorage()
@@ -191,4 +246,28 @@ async function waitForTerminalTask(
     await new Promise((resolve) => setTimeout(resolve, 2))
   }
   throw new Error('Task did not reach a terminal state')
+}
+
+async function uploadFile(
+  app: FastifyInstance,
+  tenantId: string,
+  projectId: string,
+  fileName: string,
+) {
+  const boundary = 'aibid-postgres-upload-boundary'
+  return app.inject({
+    method: 'POST',
+    url: `/api/v1/projects/${projectId}/files`,
+    headers: {
+      'x-tenant-id': tenantId,
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+    },
+    payload: Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n` +
+        'Content-Type: application/octet-stream\r\n\r\n' +
+        'supported upload bytes\r\n' +
+        `--${boundary}--\r\n`,
+    ),
+  })
 }

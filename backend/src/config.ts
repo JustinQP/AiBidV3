@@ -24,6 +24,8 @@ export interface AppConfig {
   redisClaimIdleMs: number
   workerId: string | null
   workerConcurrency: number
+  parserTimeoutMs: number
+  parserMaxOldGenerationSizeMb: number
   taskLeaseMs: number
   taskHeartbeatMs: number
   taskMaxAttempts: number
@@ -39,6 +41,16 @@ export interface AppConfig {
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
   const parsed = parseInteger(value, fallback, name)
   if (parsed === 0) throw new Error(`${name} must be greater than zero`)
+  return parsed
+}
+
+function parsePositiveSafeInteger(value: string | undefined, fallback: number, name: string): number {
+  if (value === undefined) return fallback
+  const normalized = value.trim()
+  const parsed = Number(normalized)
+  if (!/^\d+$/.test(normalized) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive safe integer`)
+  }
   return parsed
 }
 
@@ -164,6 +176,11 @@ export function loadConfig(
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(devTenantId)) {
     throw new Error('DEV_TENANT_ID must contain only letters, digits, underscores, or hyphens')
   }
+  const parserInputLimitBytes = 25 * 1024 * 1024
+  const maxUploadBytes = parseInteger(env.MAX_UPLOAD_BYTES, parserInputLimitBytes, 'MAX_UPLOAD_BYTES')
+  if (maxUploadBytes > parserInputLimitBytes) {
+    throw new Error(`MAX_UPLOAD_BYTES must not exceed ${parserInputLimitBytes}`)
+  }
 
   return {
     host: env.HOST ?? '0.0.0.0',
@@ -201,6 +218,16 @@ export function loadConfig(
     workerConcurrency: includeWorker
       ? parsePositiveInteger(env.WORKER_CONCURRENCY, 2, 'WORKER_CONCURRENCY')
       : 2,
+    parserTimeoutMs: includeWorker
+      ? parsePositiveSafeInteger(env.PARSER_TIMEOUT_MS, 60_000, 'PARSER_TIMEOUT_MS')
+      : 60_000,
+    parserMaxOldGenerationSizeMb: includeWorker
+      ? parsePositiveSafeInteger(
+          env.PARSER_MAX_OLD_GENERATION_SIZE_MB,
+          256,
+          'PARSER_MAX_OLD_GENERATION_SIZE_MB',
+        )
+      : 256,
     taskLeaseMs,
     taskHeartbeatMs,
     taskMaxAttempts: includeTaskRuntime
@@ -219,7 +246,7 @@ export function loadConfig(
       ? parsePositiveInteger(env.OUTBOX_BATCH_SIZE, 20, 'OUTBOX_BATCH_SIZE')
       : 20,
     devTenantId,
-    maxUploadBytes: parseInteger(env.MAX_UPLOAD_BYTES, 25 * 1024 * 1024, 'MAX_UPLOAD_BYTES'),
+    maxUploadBytes,
     devParserDelayMs: includeTaskRuntime
       ? parseInteger(env.DEV_PARSER_DELAY_MS, 250, 'DEV_PARSER_DELAY_MS')
       : 250,

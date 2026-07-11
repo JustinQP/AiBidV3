@@ -57,6 +57,7 @@ export interface ProjectFileRecord {
 }
 
 export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+export type ParseTaskType = 'development-document-parse' | 'document-parse-v1'
 
 export interface TaskFailure {
   code: string
@@ -67,7 +68,7 @@ export interface ProcessingTask {
   id: string
   projectId: string
   fileId: string
-  type: 'development-document-parse'
+  type: ParseTaskType
   status: TaskStatus
   progress: number
   error: TaskFailure | null
@@ -86,17 +87,88 @@ export type RequirementCategory = 'technical' | 'commercial' | 'compliance'
 export type RequirementConfirmationStatus = 'pending' | 'confirmed' | 'rejected'
 export type RequirementPriority = 'mandatory' | 'important' | 'normal'
 
-export interface RequirementSourceLocator {
+export type ExtractionMethod = 'development-fixture' | 'deterministic-rules-v1'
+
+export interface DevelopmentSourceLocator {
   kind: 'development-fixture'
   fileId: string
   fileName: string
-  pageNumber: number | null
+  pageNumber: null
   sectionPath: string[]
   paragraphIndex: null
   quote: string
 }
 
-export interface RequirementRecord {
+export interface RealLocatorBaseV1 {
+  version: 1
+  sourceFileId: string
+  sourceFileName: string
+  sourceRevision: 1
+  sourceSha256: string
+  quote: string
+  quoteSha256: string
+  textStart: number
+  textEnd: number
+  sectionPath: string[]
+  parserVersion: string
+}
+
+export interface PdfBoundingBoxV1 {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface PdfRegionV1 {
+  page: number
+  bbox: PdfBoundingBoxV1
+}
+
+export interface PdfSourceLocatorV1 extends RealLocatorBaseV1 {
+  kind: 'pdf'
+  regions: PdfRegionV1[]
+}
+
+export interface DocxTablePathEntryV1 {
+  tableIndex: number
+  rowIndex: number
+  cellIndex: number
+}
+
+export interface DocxTextRangeV1 {
+  paragraphId: string | null
+  paragraphIndex: number
+  tablePath: DocxTablePathEntryV1[]
+  charStart: number
+  charEnd: number
+}
+
+export interface DocxSourceLocatorV1 extends RealLocatorBaseV1 {
+  kind: 'docx'
+  ranges: DocxTextRangeV1[]
+}
+
+export interface TxtPositionV1 {
+  line: number
+  column: number
+}
+
+export interface TxtSourceLocatorV1 extends RealLocatorBaseV1 {
+  kind: 'txt'
+  start: TxtPositionV1
+  end: TxtPositionV1
+}
+
+export type RealSourceLocatorV1 =
+  | PdfSourceLocatorV1
+  | DocxSourceLocatorV1
+  | TxtSourceLocatorV1
+
+export type SourceLocator = DevelopmentSourceLocator | RealSourceLocatorV1
+export type RequirementSourceLocator = SourceLocator
+
+interface RequirementRecordBase {
   id: string
   projectId: string
   fileId: string
@@ -109,11 +181,22 @@ export interface RequirementRecord {
   confirmationNote: string | null
   priority: RequirementPriority
   confirmedAt: string | null
-  extractionMethod: 'development-fixture'
-  sourceLocator: RequirementSourceLocator
   createdAt: string
   updatedAt: string
 }
+
+export type RequirementRecord = RequirementRecordBase & (
+  | {
+      extractionMethod: 'development-fixture'
+      confidence: null
+      sourceLocator: DevelopmentSourceLocator
+    }
+  | {
+      extractionMethod: 'deterministic-rules-v1'
+      confidence: number
+      sourceLocator: RealSourceLocatorV1
+    }
+)
 
 export interface RequirementListQuery {
   confirmationStatus?: RequirementConfirmationStatus

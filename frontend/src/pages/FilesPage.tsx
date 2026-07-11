@@ -24,7 +24,7 @@ import { usePrototype } from '../context/PrototypeContext'
 import type { BidFile } from '../types'
 
 const MOCK_ACCEPTED_EXTENSIONS = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'zip'])
-const API_ACCEPTED_EXTENSIONS = new Set(['pdf', 'doc', 'docx', 'txt'])
+const API_ACCEPTED_EXTENSIONS = new Set(['pdf', 'docx', 'txt'])
 const API_MAX_FILE_BYTES = 25 * 1024 * 1024
 const API_UPLOAD_CONCURRENCY = 2
 
@@ -76,7 +76,7 @@ function apiErrorDescription(error: ApiError) {
 
 function validateApiFile(file: File): string | null {
   if (file.name.length === 0 || file.name.length > 255) return '文件名须为 1–255 个字符'
-  if (!API_ACCEPTED_EXTENSIONS.has(getExtension(file.name))) return '仅支持 PDF、DOC、DOCX、TXT'
+  if (!API_ACCEPTED_EXTENSIONS.has(getExtension(file.name))) return '仅支持 PDF、DOCX、TXT'
   if (file.size === 0) return '文件内容为空'
   if (file.size > API_MAX_FILE_BYTES) return '超过 25 MiB 上限'
   return null
@@ -276,7 +276,7 @@ export function FilesPage() {
         eyebrow="项目 / 招标文件"
         title="招标文件"
         description={isApi
-          ? '上传招标材料并查看开发解析任务的真实状态；当前仅接入第一阶段文件与任务闭环。'
+          ? '上传招标材料并查看异步解析任务的真实状态；当前仅接入第一阶段文件与任务闭环。'
           : '集中管理招标正文、技术附件、评分办法与资质材料，解析过程可恢复、可追溯。'}
         actions={(
           <>
@@ -299,7 +299,7 @@ export function FilesPage() {
 
       <section className="metric-strip" aria-label="文件处理概览">
         <article className="metric-card"><span className="metric-icon metric-icon-blue"><FileText size={19} /></span><div><small>文件总数</small><strong>{loading ? '—' : files.length}</strong><p>{isApi ? '页数能力尚未接入' : `共 ${totalPages} 页可定位内容`}</p></div></article>
-        <article className="metric-card"><span className="metric-icon metric-icon-green"><CheckCircle2 size={19} /></span><div><small>解析完成</small><strong>{loading ? '—' : readyCount}</strong><p>{isApi ? '开发解析任务已成功' : '正文、表格与附件已入库'}</p></div></article>
+        <article className="metric-card"><span className="metric-icon metric-icon-green"><CheckCircle2 size={19} /></span><div><small>解析完成</small><strong>{loading ? '—' : readyCount}</strong><p>{isApi ? '文档解析任务已成功' : '正文、表格与附件已入库'}</p></div></article>
         <article className="metric-card"><span className="metric-icon metric-icon-blue"><Clock3 size={19} /></span><div><small>处理中</small><strong>{loading ? '—' : parsingCount}</strong><p>{isApi ? polling ? '正在轮询真实任务进度' : '没有运行中的解析任务' : '任务可在后台继续运行'}</p></div></article>
         <article className="metric-card"><span className="metric-icon metric-icon-red"><AlertTriangle size={19} /></span><div><small>需要处理</small><strong>{loading ? '—' : errorCount}</strong><p>失败任务可安全重试</p></div></article>
       </section>
@@ -338,7 +338,7 @@ export function FilesPage() {
             type="file"
             multiple
             disabled={apiUploadBusy}
-            accept={isApi ? '.pdf,.doc,.docx,.txt' : '.pdf,.doc,.docx,.xls,.xlsx,.zip'}
+            accept={isApi ? '.pdf,.docx,.txt' : '.pdf,.doc,.docx,.xls,.xlsx,.zip'}
             onChange={(event) => {
               addFiles(Array.from(event.currentTarget.files ?? []))
               event.currentTarget.value = ''
@@ -347,7 +347,7 @@ export function FilesPage() {
           <span className="upload-icon"><Upload size={24} /></span>
           <div>
             <strong>拖拽文件到此处，或选择本地文件</strong>
-            <p>{isApi ? '支持 PDF、DOC、DOCX、TXT，文件须非空且单文件最大 25 MiB；同时最多上传 2 个。' : '支持 PDF、DOCX、XLSX、ZIP，单文件最大 200 MB；ZIP 内异常文件会单独列出。'}</p>
+            <p>{isApi ? '支持 PDF、DOCX、TXT，文件须非空且单文件最大 25 MiB；同时最多上传 2 个。' : '支持 PDF、DOCX、XLSX、ZIP，单文件最大 200 MB；ZIP 内异常文件会单独列出。'}</p>
           </div>
           <Button variant="secondary" size="sm" disabled={apiUploadBusy} onClick={() => uploadInputRef.current?.click()}>选择文件</Button>
         </div>
@@ -369,7 +369,7 @@ export function FilesPage() {
           <div className="empty-state"><AlertTriangle size={24} /><strong>无法加载项目文件</strong><p>{apiErrorDescription(error)}</p><Button variant="secondary" icon={<RefreshCw size={15} />} onClick={refresh}>重新加载</Button></div>
         ) : null}
         {!loading && !error && files.length === 0 ? (
-          <div className="empty-state"><FileText size={24} /><strong>还没有招标文件</strong><p>{isApi ? '上传 PDF、DOC、DOCX 或 TXT 后，系统会创建开发解析任务。' : '上传第一份招标材料开始解析。'}</p><Button icon={<Upload size={15} />} onClick={() => uploadInputRef.current?.click()}>上传文件</Button></div>
+          <div className="empty-state"><FileText size={24} /><strong>还没有招标文件</strong><p>{isApi ? '上传 PDF、DOCX 或 TXT 后，系统会创建异步解析任务。' : '上传第一份招标材料开始解析。'}</p><Button icon={<Upload size={15} />} onClick={() => uploadInputRef.current?.click()}>上传文件</Button></div>
         ) : null}
         {!loading && files.length > 0 ? (
           <div className="table-wrap">

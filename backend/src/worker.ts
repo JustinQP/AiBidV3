@@ -1,5 +1,6 @@
 import os from 'node:os'
 import { DevelopmentDocumentParser } from './application/development-document-parser.js'
+import { DocumentParserRouter } from './application/document-parser.js'
 import {
   DurableTaskWorker,
   type DurableTaskWorkerErrorContext,
@@ -8,6 +9,7 @@ import { FileContentLoader } from './application/file-content-loader.js'
 import { OutboxRelay, type OutboxRelayErrorContext } from './application/outbox-relay.js'
 import { loadConfig } from './config.js'
 import { createObjectStorage } from './infrastructure/object-storage-factory.js'
+import { IsolatedDocumentParser } from './infrastructure/parser/isolated-document-parser.js'
 import { RedisTaskQueue } from './infrastructure/redis/redis-task-queue.js'
 import { createRepository } from './infrastructure/repository-factory.js'
 
@@ -66,11 +68,18 @@ const relay = new OutboxRelay(
   },
   reportError,
 )
+const parser = new DocumentParserRouter(
+  new DevelopmentDocumentParser(),
+  new IsolatedDocumentParser({
+    timeoutMs: config.parserTimeoutMs,
+    maxOldGenerationSizeMb: config.parserMaxOldGenerationSizeMb,
+  }),
+)
 const worker = new DurableTaskWorker(
   repository,
   queue,
   new FileContentLoader(repository, objectStorage),
-  new DevelopmentDocumentParser(),
+  parser,
   {
     workerId,
     concurrency: config.workerConcurrency,
@@ -98,6 +107,8 @@ try {
   log('info', 'Durable task runtime started', {
     workerId,
     concurrency: config.workerConcurrency,
+    parserTimeoutMs: config.parserTimeoutMs,
+    parserMaxOldGenerationSizeMb: config.parserMaxOldGenerationSizeMb,
   })
   await Promise.all([
     relay.run(abortController.signal),

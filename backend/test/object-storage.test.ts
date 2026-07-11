@@ -16,6 +16,7 @@ import { FileContentLoader } from '../src/application/file-content-loader.js'
 import type { BidRepository } from '../src/domain/repository.js'
 import { createObjectStorage } from '../src/infrastructure/object-storage-factory.js'
 import { InMemoryObjectStorage } from '../src/infrastructure/memory/in-memory-object-storage.js'
+import { DEFAULT_PARSER_LIMITS } from '../src/infrastructure/parser/parser-types.js'
 import {
   ObjectStorageTimeoutError,
   S3ObjectStorage,
@@ -294,11 +295,39 @@ describe('object storage configuration', () => {
       taskHeartbeatMs: 10_000,
       taskMaxAttempts: 3,
       outboxBatchSize: 20,
+      parserTimeoutMs: 60_000,
+      parserMaxOldGenerationSizeMb: 256,
+      maxUploadBytes: DEFAULT_PARSER_LIMITS.maxInputBytes,
     })
 
-    expect(loadConfig({ REDIS_URL: 'rediss://user:secret@redis.example.test:6380/0' })).toMatchObject({
+    expect(
+      loadConfig({
+        REDIS_URL: 'rediss://user:secret@redis.example.test:6380/0',
+        PARSER_TIMEOUT_MS: '45000',
+        PARSER_MAX_OLD_GENERATION_SIZE_MB: '384',
+      }),
+    ).toMatchObject({
       redisUrl: 'rediss://user:secret@redis.example.test:6380/0',
+      parserTimeoutMs: 45_000,
+      parserMaxOldGenerationSizeMb: 384,
     })
+  })
+
+  it.each(['PARSER_TIMEOUT_MS', 'PARSER_MAX_OLD_GENERATION_SIZE_MB'] as const)(
+    'rejects invalid worker-only %s values',
+    (name) => {
+      for (const value of ['0', '-1', '1.5', 'not-a-number', '9007199254740992']) {
+        expect(() => loadConfig({ [name]: value })).toThrow(
+          `${name} must be a positive safe integer`,
+        )
+      }
+    },
+  )
+
+  it('rejects upload limits above the production parser input limit', () => {
+    expect(() =>
+      loadConfig({ MAX_UPLOAD_BYTES: String(DEFAULT_PARSER_LIMITS.maxInputBytes + 1) }),
+    ).toThrow(`MAX_UPLOAD_BYTES must not exceed ${DEFAULT_PARSER_LIMITS.maxInputBytes}`)
   })
 
   it('does not parse worker-only Redis settings when loading API configuration', () => {
@@ -314,6 +343,8 @@ describe('object storage configuration', () => {
         TASK_MAX_ATTEMPTS: 'not-a-number',
         REDIS_CLAIM_IDLE_MS: '1',
         DEV_PARSER_DELAY_MS: 'not-a-number',
+        PARSER_TIMEOUT_MS: 'not-a-number',
+        PARSER_MAX_OLD_GENERATION_SIZE_MB: '-1',
       }),
     ).toMatchObject({
       redisUrl: null,
@@ -324,6 +355,8 @@ describe('object storage configuration', () => {
       taskMaxAttempts: 3,
       redisClaimIdleMs: 60_000,
       devParserDelayMs: 250,
+      parserTimeoutMs: 60_000,
+      parserMaxOldGenerationSizeMb: 256,
     })
   })
 })
