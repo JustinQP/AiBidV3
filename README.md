@@ -9,7 +9,7 @@
 ```text
 AiBidV3/
 ├── frontend/   # Web 前端与当前高保真原型
-├── backend/    # Fastify API、独立 worker、开发解析适配器与数据层
+├── backend/    # Fastify API、独立 worker、隔离文档解析器与数据层
 ├── deploy/     # 本地 Compose、基础设施与运维说明
 └── docs/       # 产品、架构、接口与研发文档
 ```
@@ -20,16 +20,20 @@ AiBidV3/
 
 V0.1 高保真 Web 原型位于 [`frontend/`](frontend/)，默认仍使用 Mock 数据和 `localStorage`，核心演示流程不依赖后端。
 
-阶段 C1 可靠 worker 纵向切片已经提供：
+阶段 C1 可靠 worker 与 C2.1 数字文档解析纵向切片已经提供：
 
-- Node.js 24 LTS + Fastify 5 API，覆盖项目、文件上传、开发解析任务、要求查询与人工确认；
+- Node.js 24 LTS + Fastify 5 API，覆盖项目、文件上传、异步解析任务、要求查询与人工确认；
 - 内存和 PostgreSQL Repository，以及失败任务重试；
 - PostgreSQL outbox、Redis Streams consumer group、数据库任务租约与 fencing token；
-- 与 API 分离的 parser worker；PostgreSQL 模式由 worker 可靠执行，默认内存模式仍可进程内联调；
+- 与 API 分离的 durable worker；PostgreSQL 新上传使用 `document-parse-v1`，并在受限 Worker thread 中解析数字 PDF、DOCX 和严格 UTF-8 TXT；
+- `deterministic-rules-v1` 要求提取，以及带版本、源文件哈希、引用哈希和格式锚点的 PDF/DOCX/TXT locator；
+- 默认内存模式与历史任务继续使用明确标记的 `development-fixture`，保持零依赖联调和旧数据兼容；
 - PostgreSQL、MinIO、Redis、API 和 worker 的本地 Compose 编排；
 - OpenAPI 契约和 MVP 技术方案。
 
-当前 worker 仍调用只生成明确标记固定数据的 `DevelopmentDocumentParser`，不进行真实 PDF/DOCX 内容提取；这次交付验证的是任务可靠性，不是解析准确率。S3 模式的新上传原件进入对象存储，PostgreSQL 保存对象引用、任务和业务事实，旧 `bytea` 行仅作迁移兼容。高保真前端目前仍完全使用 Mock 数据和 `localStorage`，尚未接入这套真实 API；前后端联调是后续独立步骤。真实解析、locator、生产级认证授权和正式 DOCX 渲染也仍待后续阶段实现。
+C2.1 只覆盖带文本层的数字 PDF、DOCX 和严格 UTF-8 TXT，不包含扫描件/OCR、legacy `.doc` 或模型判定。S3 模式的新上传原件进入对象存储，PostgreSQL 保存对象引用、任务和业务事实，旧 `bytea` 行仅作迁移兼容。高保真前端默认仍使用 Mock 数据和 `localStorage`，设置 API 数据源后可联调项目、上传、真实证据展示与人工确认。
+
+当前 locator 是可校验的证据元数据，不等于已经提供原件下载、原件 viewer 或“已验证”高亮；这些交互以及生产准确率语料、量化 SLO、生产级认证授权和正式 DOCX 渲染仍属于后续门禁。
 
 ## 快速开始
 
@@ -43,14 +47,14 @@ npm run dev
 
 默认地址：`http://localhost:4173`
 
-运行 Phase C1 API、worker 与本地基础设施：
+运行 Phase C2.1 API、worker 与本地基础设施：
 
 ```bash
 cp deploy/.env.example deploy/.env
 docker compose --env-file deploy/.env -f deploy/docker-compose.yml up --build
 ```
 
-API 默认地址：`http://localhost:3000`。可按 [`backend/README.md`](backend/README.md) 的 `curl` 示例独立验证 API；当前前端不会自动切换到该数据源。详细方式及数据清理说明见 [`deploy/README.md`](deploy/README.md)。
+API 默认地址：`http://localhost:3000`。可按 [`backend/README.md`](backend/README.md) 的示例独立验证 API；前端需要显式设置 `VITE_DATA_SOURCE=api`，不会自动切换数据源。详细方式及数据清理说明见 [`deploy/README.md`](deploy/README.md)。
 
 工程检查：
 

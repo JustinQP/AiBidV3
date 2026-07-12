@@ -116,8 +116,8 @@ describe('PostgreSQL lease clock', () => {
     )
     expect(renew).toContain('AND lease_expires_at > clock_timestamp()')
 
-    const complete = statementContaining(statements, 'SELECT * FROM parse_tasks')
-    expect(complete).toContain('AND lease_expires_at > clock_timestamp()')
+    const complete = statementContaining(statements, 'FROM parse_tasks AS task')
+    expect(complete).toContain('AND task.lease_expires_at > clock_timestamp()')
     for (const fragment of [
       "SET status = 'failed', error = $5::jsonb",
       "SET status = 'queued', progress = 0",

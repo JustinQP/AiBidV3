@@ -1,8 +1,20 @@
 import type { ObjectReference } from './object-storage.js'
+import type { ExtractionMethod, SourceLocator } from './source-locator.js'
+
+export type {
+  DevelopmentSourceLocator,
+  DocxSourceLocatorV1,
+  ExtractionMethod,
+  PdfSourceLocatorV1,
+  RealLocatorBaseV1,
+  SourceLocator,
+  TxtSourceLocatorV1,
+} from './source-locator.js'
 
 export type ProjectStatus = 'draft' | 'active' | 'archived'
 export type FileParseStatus = 'queued' | 'parsing' | 'parsed' | 'failed'
 export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+export type ParseTaskType = 'development-document-parse' | 'document-parse-v1'
 export type RequirementCategory = 'technical' | 'commercial' | 'compliance'
 export type RequirementPriority = 'mandatory' | 'important' | 'normal'
 export type ConfirmationStatus = 'pending' | 'confirmed' | 'rejected'
@@ -59,7 +71,7 @@ export interface ParseTask {
   tenantId: string
   projectId: string
   fileId: string
-  type: 'development-document-parse'
+  type: ParseTaskType
   status: TaskStatus
   progress: number
   attempt: number
@@ -91,16 +103,6 @@ export interface TaskOutboxEvent {
   createdAt: string
 }
 
-export interface DevelopmentSourceLocator {
-  kind: 'development-fixture'
-  fileId: string
-  fileName: string
-  pageNumber: null
-  sectionPath: string[]
-  paragraphIndex: null
-  quote: string
-}
-
 export interface Requirement {
   id: string
   tenantId: string
@@ -115,8 +117,9 @@ export interface Requirement {
   confirmationStatus: ConfirmationStatus
   confirmationNote: string | null
   confirmedAt: string | null
-  extractionMethod: 'development-fixture'
-  sourceLocator: DevelopmentSourceLocator
+  extractionMethod: ExtractionMethod
+  confidence: number | null
+  sourceLocator: SourceLocator
   createdAt: string
   updatedAt: string
 }

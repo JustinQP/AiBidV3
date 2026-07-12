@@ -1,8 +1,8 @@
 # AiBidV3 后端
 
-Phase C1 可运行的可靠 worker 纵向切片：项目创建、招标文件上传、S3 原件持久化、PostgreSQL outbox、Redis Streams 投递、独立 worker、要求查询与人工确认。运行时为 Node.js 24 LTS、TypeScript 和 Fastify 5。
+Phase C1 可靠交付与 C2.1 数字文档解析纵向切片：项目创建、招标文件上传、S3 原件持久化、PostgreSQL outbox、Redis Streams 投递、独立 worker、确定性要求提取、要求查询与人工确认。运行时为 Node.js 24 LTS、TypeScript 和 Fastify 5。
 
-> **能力边界**：当前的 `DevelopmentDocumentParser` 是开发适配器，只生成固定演示数据，**不会读取或解析 PDF/DOC/DOCX 内容**。它产生的要求和 `sourceLocator` 全部标记为 `development-fixture`，页码为 `null`，不能用于真实投标文件、准确性评估或生产决策。
+> **能力边界**：PostgreSQL 模式的新上传使用 `document-parse-v1`，在受限 Worker thread 中解析带文本层的数字 PDF、DOCX 和严格 UTF-8 TXT，并由 `deterministic-rules-v1` 生成版本化证据。默认内存模式和历史 `development-document-parse` 任务仍返回 `development-fixture`。扫描件/OCR、legacy `.doc`、原件 viewer/download 与已验证高亮、生产准确率语料及量化 SLO 均未交付。
 
 ## 快速开始
 
@@ -41,9 +41,9 @@ curl -X POST http://localhost:3000/api/v1/projects \
 | `GET` | `/api/v1/projects/:projectId/requirements` | 要求列表；支持 `confirmationStatus`、`priority` 筛选 |
 | `PATCH` | `/api/v1/projects/:projectId/requirements/:requirementId/confirmation` | `{ "status":"confirmed|rejected", "note"?: string }` |
 
-上传接受 `.pdf`、`.doc`、`.docx` 和便于开发夹具验证的 `.txt`，默认上限 25 MiB。上传响应为 `202 { data: { file, task } }`。PostgreSQL 模式下，API 在同一事务内创建任务与 outbox，独立 worker 随后将任务从 `queued` 推进到 `running`，最后成为 `succeeded` 或 `failed`；`attempt` 在每次成功领取任务租约时增加，人工重试后重置。默认内存模式仍在 API 进程内执行开发任务。
+上传接受数字 `.pdf`、`.docx` 和严格 UTF-8 `.txt`；legacy `.doc` 同步返回 `415`。单文件 25 MiB 是硬上限，`MAX_UPLOAD_BYTES` 只能收紧。上传响应为 `202 { data: { file, task } }`。PostgreSQL 模式下，API 在同一事务内创建 `document-parse-v1` 任务与 outbox，独立 worker 随后将任务从 `queued` 推进到 `running`，最后成为 `succeeded` 或 `failed`；`attempt` 在每次成功领取任务租约时增加，人工重试后重置。默认内存模式仍在 API 进程内执行 `development-document-parse` fixture 任务。
 
-当前上传校验只检查文件名扩展名和大小，不验证 MIME 与文件头，也没有病毒扫描；它是开发入口，不是安全上传网关。
+API 在读取 multipart 正文前检查文件名扩展名，并检查非空与大小；隔离解析器进一步校验扩展名/MIME 配对、记录大小、SHA-256 和格式结构。当前仍没有病毒扫描，因此这是开发入口，不是生产上传安全网关。
 
 PostgreSQL 模式的 API 不连接 Redis，也不执行解析器。任务与 outbox 先在数据库事务中提交；worker 的 relay 再投递 Redis Stream，并由 consumer group 消费。消息允许重复交付，worker 使用 PostgreSQL lease token 对心跳、进度和终态写入做 fencing。系统提供 at-least-once delivery + fenced effects，**不宣称 exactly-once**。完整决策见 [`../docs/adr/0001-durable-task-delivery.md`](../docs/adr/0001-durable-task-delivery.md)。
 
@@ -76,6 +76,8 @@ REDIS_CONSUMER_GROUP=aibid-parser
 REDIS_CLAIM_IDLE_MS=60000
 WORKER_ID=worker-local-1
 WORKER_CONCURRENCY=2
+PARSER_TIMEOUT_MS=60000
+PARSER_MAX_OLD_GENERATION_SIZE_MB=256
 TASK_LEASE_MS=30000
 TASK_HEARTBEAT_MS=10000
 TASK_MAX_ATTEMPTS=3
@@ -112,6 +114,7 @@ npm run worker
 - `object_key`、`object_version_id`、`object_etag`、`object_stored_at` 对象引用及部分唯一索引；
 - 兼容旧 `bytea` 行的存储来源约束；`content` 已可空，但暂不删除以支持迁移和回滚；
 - outbox 事件，以及任务 `attempt`、租约、fencing token、重试调度和终态约束。
+- `document-parse-v1` 任务类型、`deterministic-rules-v1`、0–1 confidence 与 version 1 PDF/DOCX/TXT locator 的证据一致性约束，同时保留历史 fixture 行。
 
 S3 模式的新上传使用服务端生成的租户/项目/文件对象键，原件不写入 `content`。解析读取受记录大小的硬上限约束，并复核大小和 SHA-256。数据库写入明确失败时会补偿删除对象；若提交结果因连接中断无法确认，则先回查文件与任务，无法确认时保留对象等待后续对账，避免误删已提交记录所引用的原件。旧 `bytea` 行仍可读取，删除兼容列前必须完成对象回填、SHA-256 校验、备份和回滚演练。
 
@@ -131,7 +134,7 @@ S3 模式的新上传使用服务端生成的租户/项目/文件对象键，原
 | `DATABASE_SSL` | `false` | 启用 PostgreSQL TLS（开发配置不校验证书） |
 | `MIGRATE_ON_START` | `false` | 启动前执行迁移 |
 | `DEV_TENANT_ID` | `tenant-demo` | 无请求头时的开发租户 |
-| `MAX_UPLOAD_BYTES` | `26214400` | 单文件上限 |
+| `MAX_UPLOAD_BYTES` | `26214400` | 单文件上限；不得超过 25 MiB，只能收紧 |
 | `DEV_PARSER_DELAY_MS` | `250` | 仅默认内存模式的进程内开发解析延迟 |
 | `OBJECT_STORAGE_DRIVER` | `memory` | `memory` 或 `s3`；Compose 明确设置为 `s3` |
 | `OBJECT_STORAGE_TIMEOUT_MS` | `10000` | 对象存储单次操作超时，单位毫秒 |
@@ -146,6 +149,8 @@ S3 模式的新上传使用服务端生成的租户/项目/文件对象键，原
 | `REDIS_CLAIM_IDLE_MS` | `60000` | pending 消息允许接管前的 idle 时间；不得小于任务租约 |
 | `WORKER_ID` | `hostname:pid` | 可显式覆盖的 worker 标识，多实例不得重复；Compose 固定本地值 |
 | `WORKER_CONCURRENCY` | `2` | 单 worker 最大并发任务数 |
+| `PARSER_TIMEOUT_MS` | `60000` | 单次隔离解析硬超时；超时为永久任务错误 |
+| `PARSER_MAX_OLD_GENERATION_SIZE_MB` | `256` | parser Worker thread 的 V8 old-generation 上限 |
 | `TASK_LEASE_MS` | `30000` | PostgreSQL 任务租约时长 |
 | `TASK_HEARTBEAT_MS` | `10000` | 租约续期周期；必须小于租约时长 |
 | `TASK_MAX_ATTEMPTS` | `3` | 自动领取/执行尝试上限 |
@@ -165,7 +170,7 @@ npm run build
 npm run check
 ```
 
-真实 worker adapter smoke 需要已启动并完成迁移的 PostgreSQL、Redis 与 MinIO；它覆盖 outbox、pending 接管、重复消息和 fenced results：
+真实 worker smoke 需要已启动并完成迁移的 PostgreSQL、Redis 与 MinIO；它覆盖 outbox、pending 接管、重复消息、fenced results，以及真实 TXT 的 `deterministic-rules-v1` 证据：
 
 ```bash
 npm run worker:smoke
@@ -187,10 +192,11 @@ docker run --rm aibid-backend npm run worker:prod
 ```text
 src/
 ├── api/                  # HTTP 路由、租户上下文、响应 presenter
-├── application/          # 上传、任务处理与开发解析适配器
+├── application/          # 上传、任务处理与 parser 路由
 ├── domain/               # 领域模型和 Repository 抽象
 ├── infrastructure/
 │   ├── memory/           # 零依赖 Repository 与对象存储
+│   ├── parser/           # PDF/DOCX/TXT 提取、确定性规则与隔离 Worker thread
 │   ├── postgres/         # PostgreSQL 实现与迁移执行器
 │   ├── redis/            # Redis Streams delivery adapter
 │   └── s3/               # S3 兼容对象存储适配器
@@ -199,4 +205,6 @@ src/
 └── worker.ts             # 独立 worker 进程入口
 ```
 
-Phase C1 已把 PostgreSQL 模式的解析任务移到独立 worker，并提供 outbox、Redis pending 接管、数据库租约、心跳、最大尝试次数和 fencing。它仍使用 `DevelopmentDocumentParser`，没有真实 PDF/DOCX 文本提取、版面恢复或 locator；这些能力和解析基准集属于 Phase C2。认证授权、病毒扫描、HTTP 幂等、持久孤儿对象回收、审计以及生产级高可用仍是后续上线门禁。
+Phase C2.1 已在不改变 C1 交付语义的前提下，为 PostgreSQL 新任务接入数字 PDF/DOCX/严格 UTF-8 TXT 解析、`deterministic-rules-v1` 和 PDF/DOCX/TXT locator。CPU 密集解析运行在独立 Worker thread；超时、资源上限、格式损坏、加密 PDF 与 OCR-required 等稳定错误会按永久失败持久化。内存模式和历史任务仍使用 `DevelopmentDocumentParser` 兼容。
+
+扫描 PDF/OCR、legacy `.doc`、原件 viewer/download、基于原件的已验证高亮、生产准确率语料/量化 SLO，以及认证授权、病毒扫描、HTTP 幂等、持久孤儿对象回收、审计和生产级高可用仍是后续上线门禁。

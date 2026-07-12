@@ -2,6 +2,7 @@ const baseUrl = process.env.API_BASE_URL ?? 'http://127.0.0.1:3000'
 const tenantId = `compose-smoke-${Date.now()}`
 const headers = { 'x-tenant-id': tenantId }
 const requestTimeoutMs = 10_000
+const requirementQuote = '投标人必须提交完整的技术实施方案。'
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
@@ -45,7 +46,7 @@ if (typeof projectId !== 'string') throw new Error('Compose smoke did not receiv
 const form = new FormData()
 form.append(
   'file',
-  new Blob(['compose durable worker smoke fixture'], { type: 'text/plain' }),
+  new Blob([`# 技术要求\n${requirementQuote}`], { type: 'text/plain' }),
   'compose-smoke.txt',
 )
 const uploadResponse = await request(`/api/v1/projects/${projectId}/files`, {
@@ -81,8 +82,23 @@ const requirementsResponse = await request(
   { headers },
 )
 const requirements = requirementsResponse?.data
-if (!Array.isArray(requirements) || requirements.length !== 3) {
-  throw new Error('Compose worker did not persist the three development fixture requirements')
+const requirement = Array.isArray(requirements) ? requirements[0] : null
+const locator = requirement?.sourceLocator
+const quoteSha256 = await crypto.subtle.digest(
+  'SHA-256',
+  new TextEncoder().encode(requirementQuote),
+)
+const expectedQuoteSha256 = Array.from(new Uint8Array(quoteSha256), (byte) =>
+  byte.toString(16).padStart(2, '0')).join('')
+if (!Array.isArray(requirements) || requirements.length !== 1 ||
+    requirement?.extractionMethod !== 'deterministic-rules-v1' ||
+    requirement.confidence !== 0.95 || requirement.description !== requirementQuote ||
+    locator?.kind !== 'txt' || locator.quote !== requirementQuote ||
+    locator.quoteSha256 !== expectedQuoteSha256 || locator.parserVersion !== 'deterministic-rules-v1' ||
+    locator.start?.line !== 2 || locator.start?.column !== 0 ||
+    locator.end?.line !== 2 || locator.end?.column !== requirementQuote.length ||
+    locator.sectionPath?.length !== 1 || locator.sectionPath[0] !== '技术要求') {
+  throw new Error(`Compose worker did not persist real deterministic evidence: ${JSON.stringify(requirements)}`)
 }
 
 await request(

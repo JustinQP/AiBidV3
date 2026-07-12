@@ -5,7 +5,6 @@ import {
   CircleAlert,
   FileSearch,
   Filter,
-  LocateFixed,
   MapPin,
   Pencil,
   RefreshCw,
@@ -23,6 +22,11 @@ import { projectRoute, useCurrentProjectId } from '../api/routing'
 import { Badge, Button, Drawer, InlineMessage, LoadingBlock, Modal, PageHeader, StatusBadge } from '../components/ui'
 import { usePrototype } from '../context/PrototypeContext'
 import type { RequirementType } from '../types'
+import {
+  RequirementEvidenceDetails,
+  RequirementEvidenceNotice,
+  RequirementSourceLabel,
+} from './requirement-evidence'
 
 const MOCK_REQUIREMENT_TYPES: Array<RequirementDisplayType | '全部'> = ['全部', '评分项', '技术要求', '资格项', '商务要求', '无效条款']
 const API_REQUIREMENT_TYPES: Array<RequirementDisplayType | '全部'> = ['全部', '技术要求', '商务要求', '合规要求']
@@ -54,6 +58,10 @@ function confidenceClass(value: number) {
   if (value < LOW_CONFIDENCE_THRESHOLD) return 'confidence-low'
   if (value < 93) return 'confidence-medium'
   return 'confidence-high'
+}
+
+function formatConfidencePercent(confidence: number) {
+  return `${Math.round(confidence)}%`
 }
 
 function apiErrorDescription(error: ApiError) {
@@ -106,9 +114,7 @@ export function AnalysisPage() {
   const filesRoute = projectId ? projectRoute(projectId, 'files') : '/projects'
   const requirementsRoute = projectId ? projectRoute(projectId, 'requirements') : '/projects'
 
-  useEffect(() => {
-    if (!requirementTypes.includes(typeFilter)) setTypeFilter('全部')
-  }, [requirementTypes, typeFilter])
+  const selectedTypeFilter = requirementTypes.includes(typeFilter) ? typeFilter : '全部'
 
   useEffect(() => {
     if (!isApi) return
@@ -119,12 +125,12 @@ export function AnalysisPage() {
   const filteredRequirements = useMemo(() => {
     const keyword = query.trim().toLowerCase()
     return requirements.filter((item) => {
-      const matchesType = typeFilter === '全部' || item.type === typeFilter
+      const matchesType = selectedTypeFilter === '全部' || item.type === selectedTypeFilter
       const matchesConfidence = isApi || !lowConfidenceOnly || (item.confidence !== null && item.confidence < LOW_CONFIDENCE_THRESHOLD)
       const matchesQuery = keyword.length === 0 || `${item.code} ${item.title} ${item.summary} ${item.source}`.toLowerCase().includes(keyword)
       return matchesType && matchesConfidence && matchesQuery
     })
-  }, [isApi, lowConfidenceOnly, query, requirements, typeFilter])
+  }, [isApi, lowConfidenceOnly, query, requirements, selectedTypeFilter])
 
   const confirmMockRequirement = (requirement: RequirementListItem) => {
     updateRequirement(requirement.id, {
@@ -209,7 +215,7 @@ export function AnalysisPage() {
       emptyActionLabel = '查看任务'
     } else if (fileResource.files.length === 0) {
       emptyTitle = '尚无可解析文件'
-      emptyDescription = '请先上传 PDF、DOC、DOCX 或 TXT 文件。'
+      emptyDescription = '请先上传 PDF、DOCX 或 TXT 文件。'
     } else if (fileResource.files.some((file) => file.status === 'error')) {
       emptyTitle = '解析任务需要处理'
       emptyDescription = '至少一个解析任务失败，请在招标文件页查看错误并重试。'
@@ -226,7 +232,7 @@ export function AnalysisPage() {
         eyebrow="项目 / 智能解析"
         title="智能解析与人工确认"
         description={isApi
-          ? '查看开发解析适配器返回的结构化要求，并将逐条确认或驳回结果保存到 API。'
+          ? '查看结构化要求及其来源证据，并将逐条确认或驳回结果保存到 API。'
           : '逐项核对评分、资格、技术与无效条款；每条结果都可定位原文并保留人工修正记录。'}
         actions={(
           <>
@@ -250,11 +256,7 @@ export function AnalysisPage() {
         <article className="metric-card"><span className="metric-icon metric-icon-red"><ShieldAlert size={19} /></span><div><small>强制要求</small><strong>{loading ? '—' : mandatoryCount}</strong><p>{isApi ? '由强制优先级映射' : '含无效投标条款'}</p></div></article>
       </section>
 
-      {isApi ? (
-        <InlineMessage tone="warning" title="当前结果来自开发解析适配器">
-          <code>development-fixture</code> 不读取真实文件正文，也不提供置信度或真实页码；结果仅用于验证接口闭环。
-        </InlineMessage>
-      ) : null}
+      <RequirementEvidenceNotice requirements={requirements} />
 
       {!isApi && lowConfidenceCount > 0 ? (
         <InlineMessage tone="warning" title={`${lowConfidenceCount} 条低置信度结果待确认`}>
@@ -285,7 +287,7 @@ export function AnalysisPage() {
 
         <div className="filter-tabs analysis-type-tabs" role="tablist" aria-label="解析结果类型">
           {requirementTypes.map((type) => (
-            <button key={type} className={typeFilter === type ? 'active' : ''} onClick={() => setTypeFilter(type)}>
+            <button key={type} className={selectedTypeFilter === type ? 'active' : ''} onClick={() => setTypeFilter(type)}>
               {type}<span>{type === '全部' ? requirements.length : requirements.filter((item) => item.type === type).length}</span>
             </button>
           ))}
@@ -301,7 +303,7 @@ export function AnalysisPage() {
         {!loading && requirements.length > 0 ? (
           <div className="table-wrap">
             <table className="data-table analysis-table">
-              <thead><tr><th>编号 / 类型</th><th>识别内容</th><th>{isApi ? '来源信息' : '原文来源'}</th><th>置信度</th><th>确认状态</th><th className="align-right">操作</th></tr></thead>
+              <thead><tr><th>编号 / 类型</th><th>识别内容</th><th>来源证据</th><th>置信度</th><th>确认状态</th><th className="align-right">操作</th></tr></thead>
               <tbody>
                 {filteredRequirements.map((item) => {
                   const lowConfidence = item.confidence !== null && item.confidence < LOW_CONFIDENCE_THRESHOLD
@@ -310,12 +312,12 @@ export function AnalysisPage() {
                     <tr key={item.id} className={`${item.confirmationStatus === 'pending' ? 'row-attention' : ''} ${lowConfidence ? 'low-confidence' : ''}`}>
                       <td><div className="table-primary"><strong>{item.code}</strong><div className="badge-row"><Badge tone={typeTone(item.type)}>{item.type}</Badge>{item.mandatory ? <Badge tone="red">强制</Badge> : null}{item.score !== null ? <Badge tone="blue">{item.score} 分</Badge> : null}</div></div></td>
                       <td><div className="requirement-summary">{item.title !== item.summary ? <strong>{item.title}</strong> : null}<p>{item.summary}</p>{item.confirmationStatus === 'pending' ? <small><CircleAlert size={13} />{isApi ? '建议人工核对后确认或驳回' : '建议人工核对后确认'}</small> : null}</div></td>
-                      <td><button className="source-link" onClick={() => setSourceId(item.id)}><MapPin size={14} /><span><strong>{item.source}</strong><small>{item.page === null ? '页码未提供 · 查看来源信息' : `第 ${item.page} 页 · 点击定位`}</small></span></button></td>
+                      <td><button className="source-link" onClick={() => setSourceId(item.id)}><MapPin size={14} /><RequirementSourceLabel requirement={item} /></button></td>
                       <td>
                         {item.confidence === null ? (
-                          <div className="confidence-cell"><div><strong>未提供</strong><small>开发适配器未输出</small></div></div>
+                          <div className="confidence-cell"><div><strong>未提供</strong><small>{item.evidence.kind === 'development-fixture' ? '历史夹具不提供' : '暂无规则得分'}</small></div></div>
                         ) : (
-                          <div className="confidence-cell"><div><strong>{item.confidence}%</strong><small>{item.confidence < LOW_CONFIDENCE_THRESHOLD ? '低置信度' : item.confidence < 93 ? '建议复核' : '可信'}</small></div><div className="confidence-meter"><span className={`confidence-fill ${confidenceClass(item.confidence)}`} style={{ width: `${item.confidence}%`, backgroundColor: item.confidence < LOW_CONFIDENCE_THRESHOLD ? '#dc3e36' : item.confidence < 93 ? '#d98a16' : '#22a35a' }} /></div></div>
+                          <div className="confidence-cell"><div><strong>{formatConfidencePercent(item.confidence)}</strong><small>{item.confidence < LOW_CONFIDENCE_THRESHOLD ? '低规则得分 · 需人工确认' : item.confidence < 93 ? '建议复核 · 需人工确认' : '较高规则得分 · 仍需人工确认'}</small></div><div className="confidence-meter"><span className={`confidence-fill ${confidenceClass(item.confidence)}`} style={{ width: `${Math.round(item.confidence)}%`, backgroundColor: item.confidence < LOW_CONFIDENCE_THRESHOLD ? '#dc3e36' : item.confidence < 93 ? '#d98a16' : '#287f82' }} /></div></div>
                         )}
                       </td>
                       <td>{confirmationBadge(item)}</td>
@@ -342,49 +344,20 @@ export function AnalysisPage() {
 
       <Drawer
         open={Boolean(sourceRequirement)}
-        title={isApi ? '来源信息（开发夹具）' : '原文定位'}
-        subtitle={sourceRequirement ? isApi ? sourceRequirement.source : `${sourceRequirement.source} · 第 ${sourceRequirement.page} 页` : undefined}
+        title={sourceRequirement?.evidence.kind === 'development-fixture'
+          ? '来源说明（非真实证据）'
+          : sourceRequirement?.evidence.kind === 'mock-preview' ? '原型来源预览' : '解析证据'}
+        subtitle={sourceRequirement ? `${sourceRequirement.source} · ${sourceRequirement.evidence.label}` : undefined}
         onClose={() => setSourceId(null)}
       >
-        {sourceRequirement ? isApi ? (
-          <div className="drawer-stack">
-            <section className="drawer-section drawer-meta-grid">
-              <div><small>解析编号</small><strong>{sourceRequirement.code}</strong></div>
-              <div><small>条款类型</small><Badge tone={typeTone(sourceRequirement.type)}>{sourceRequirement.type}</Badge></div>
-              <div><small>置信度</small><strong>未提供</strong></div>
-              <div><small>定位状态</small><strong>非真实定位</strong></div>
-            </section>
-            <section className="drawer-section">
-              <header><div><h3>开发解析输出</h3><p>{sourceRequirement.sectionPath.length > 0 ? sourceRequirement.sectionPath.join(' / ') : '未提供章节路径'}</p></div><Badge tone="amber">开发夹具</Badge></header>
-              <div className="source-preview">
-                <div className="source-page"><FileSearch size={16} />页码未提供</div>
-                <p className="source-highlight">{sourceRequirement.sourceQuote}</p>
-              </div>
-            </section>
-            <InlineMessage tone="warning" title="这不是原文定位"><code>development-fixture</code> 不读取上传文件，不能作为投标依据或已核验引用。</InlineMessage>
-            {sourceRequirement.confirmationNote ? <InlineMessage tone="info" title="人工备注">{sourceRequirement.confirmationNote}</InlineMessage> : null}
-            <div className="drawer-actions"><Button variant="secondary" onClick={() => setSourceId(null)}>关闭</Button></div>
-          </div>
-        ) : (
-          <div className="drawer-stack">
-            <section className="drawer-section drawer-meta-grid">
-              <div><small>解析编号</small><strong>{sourceRequirement.code}</strong></div>
-              <div><small>条款类型</small><Badge tone={typeTone(sourceRequirement.type)}>{sourceRequirement.type}</Badge></div>
-              <div><small>置信度</small><strong>{sourceRequirement.confidence}%</strong></div>
-              <div><small>定位锚点</small><strong>页 {sourceRequirement.page} / 段落 4</strong></div>
-            </section>
-            <section className="drawer-section">
-              <header><div><h3>原文上下文</h3><p>高亮内容为当前解析结果对应的原文片段。</p></div><Badge tone="green" dot>坐标已校验</Badge></header>
-              <div className="source-preview">
-                <div className="source-page"><FileSearch size={16} />第 {sourceRequirement.page} 页</div>
-                <p>投标人应根据本项目建设目标、服务边界及评分要求，提供完整、可执行并具备充分证明材料的响应方案。</p>
-                <p className="source-highlight">{sourceRequirement.summary}</p>
-                <p>相关证明材料须与投标人主体保持一致，并在投标文件对应章节中明确标注，便于评审专家核验。</p>
-              </div>
-            </section>
-            <InlineMessage tone="info" title="来源可追溯">该原文锚点会随解析结果同步到响应矩阵、章节写作和审核记录。</InlineMessage>
-            <div className="drawer-actions"><Button variant="secondary" icon={<LocateFixed size={15} />} onClick={() => notify({ title: '已定位至原文', description: `已打开第 ${sourceRequirement.page} 页对应段落。`, tone: 'info' })}>打开整页</Button><Button icon={<Pencil size={15} />} onClick={() => { openEditor(sourceRequirement); setSourceId(null) }}>修正结果</Button></div>
-          </div>
+        {sourceRequirement ? (
+          <RequirementEvidenceDetails
+            requirement={sourceRequirement}
+            onClose={() => setSourceId(null)}
+            onEdit={sourceRequirement.evidence.kind === 'mock-preview'
+              ? () => { openEditor(sourceRequirement); setSourceId(null) }
+              : undefined}
+          />
         ) : null}
       </Drawer>
 

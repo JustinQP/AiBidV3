@@ -69,6 +69,9 @@ export class UploadProcessingService {
     if (!claimed) return
 
     try {
+      if (claimed.task.type !== 'development-document-parse') {
+        throw new Error('Development processor cannot execute a real document parse task')
+      }
       const file = await this.fileContentLoader.loadForProcessing(tenantId, claimed.task.fileId)
       if (!file) throw new Error('Uploaded file disappeared before development parsing')
       const completedAt = new Date().toISOString()

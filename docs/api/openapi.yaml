@@ -5,8 +5,11 @@ info:
   summary: AI 投标书 MVP 纵向切片 API
   description: |
     AiBidV3 MVP 开发契约，覆盖项目、文件上传、可靠异步解析任务、
-    提取要求和人工确认。PostgreSQL 模式由独立 worker 执行任务，但当前
-    parser 仍只生成 development fixture，不代表真实 PDF/DOCX 解析。
+    提取要求和人工确认。PostgreSQL 模式的新上传创建 `document-parse-v1`
+    任务，由独立 worker 在线程隔离与资源边界内解析数字 PDF、DOCX 和严格
+    UTF-8 TXT，并用 `deterministic-rules-v1` 产出可校验的版本化 locator。
+    默认内存模式和历史任务继续使用明确标记的 `development-fixture`，不得
+    把该兼容结果呈现为真实原文证据。
 
     JSON 字段使用 camelCase。成功响应统一包裹在 `data` 中；错误响应
     使用 RFC 7807 `application/problem+json`。
@@ -153,7 +156,7 @@ paths:
     post:
       tags: [Files]
       operationId: uploadProjectFile
-      summary: 上传文件并创建开发解析任务
+      summary: 上传文件并创建异步解析任务
       description: |
         接收名为 `file` 的 multipart 文件。文件与任务记录持久化成功后立即
         返回 `202 Accepted`；解析结果通过任务资源轮询，不在本请求中返回。
@@ -161,7 +164,10 @@ paths:
         新上传会先写入对象存储，再以数据库事务创建文件元数据与任务。对象
         存储不可用时返回 `503`，且不会创建文件或任务记录。
 
-        第一阶段解析结果来自明确标注的开发适配器，不是对原文件内容的真实解析。
+        仅接受数字 PDF、DOCX 和严格 UTF-8 TXT；legacy `.doc` 返回 `415`。
+        PostgreSQL 模式创建 `document-parse-v1` 并由独立 worker 执行真实确定性
+        解析；默认内存模式创建 `development-document-parse` 并保留 fixture 兼容。
+        单文件硬上限为 25 MiB，部署配置只能收紧，不能调高。
       requestBody:
         required: true
         content:
@@ -173,10 +179,10 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: 招标文件；默认上限 25 MiB，可由服务端配置调整
+                  description: 数字 PDF、DOCX 或严格 UTF-8 TXT；25 MiB 硬上限仅可收紧
             encoding:
               file:
-                contentType: application/pdf, application/msword, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain
+                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain
       responses:
         "202":
           description: 文件已接收，解析任务已排队
@@ -530,7 +536,8 @@ components:
         sizeBytes:
           type: integer
           minimum: 1
-          description: 服务端默认限制为 25 MiB，可由部署配置收紧或调整
+          maximum: 26214400
+          description: 单文件 25 MiB 硬上限；部署配置只能收紧
         sha256:
           type: string
           pattern: "^[a-f0-9]{64}$"
@@ -584,8 +591,10 @@ components:
           $ref: "#/components/schemas/ResourceId"
         type:
           type: string
-          const: development-document-parse
-          description: Phase C1 独立 worker 使用的开发适配器任务类型；Phase C2 接入真实 parser 时再版本化扩展
+          enum: [development-document-parse, document-parse-v1]
+          description: |
+            `document-parse-v1` 用于 PostgreSQL 模式的新上传和真实隔离解析；
+            `development-document-parse` 保留给默认内存模式与历史 fixture 任务。
         status:
           $ref: "#/components/schemas/TaskStatus"
         progress:
@@ -629,8 +638,8 @@ components:
       type: object
       additionalProperties: false
       description: |
-        第一阶段开发定位器。`kind=development-fixture` 明确表示内容不是从原文件
-        真实定位所得，客户端不得把它渲染为已验证的原文引用。
+        内存模式与历史任务的兼容定位器。`kind=development-fixture` 明确表示
+        内容不是从原文件真实定位所得，客户端不得渲染为已验证的原文引用。
       required:
         - kind
         - fileId
@@ -657,10 +666,247 @@ components:
           type: "null"
         quote:
           type: string
+          minLength: 1
+
+    RealSourceLocatorBaseV1:
+      type: object
+      description: |
+        真实解析 locator 的版本化公共元数据。`textStart`/`textEnd` 是规范化
+        文本中的 UTF-16 半开区间，必须与 `quote` 一致；哈希均为小写 SHA-256。
+      required:
+        - version
+        - sourceFileId
+        - sourceFileName
+        - sourceRevision
+        - sourceSha256
+        - quote
+        - quoteSha256
+        - textStart
+        - textEnd
+        - sectionPath
+        - parserVersion
+      properties:
+        version:
+          type: integer
+          const: 1
+        sourceFileId:
+          $ref: "#/components/schemas/ResourceId"
+        sourceFileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        sourceRevision:
+          type: integer
+          const: 1
+        sourceSha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        quote:
+          type: string
+          minLength: 1
+          description: NFC、LF 换行的精确规范化原文片段
+        quoteSha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        textStart:
+          type: integer
+          minimum: 0
+        textEnd:
+          type: integer
+          minimum: 1
+          description: 必须大于 textStart，且差值等于 quote 的 UTF-16 长度
+        sectionPath:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        parserVersion:
+          type: string
+          minLength: 1
+
+    PdfBoundingBoxV1:
+      type: object
+      additionalProperties: false
+      description: 左上角原点、0–1 归一化的页面边界框；矩形必须留在页面内
+      required: [x, y, width, height]
+      properties:
+        x:
+          type: number
+          minimum: 0
+          maximum: 1
+        y:
+          type: number
+          minimum: 0
+          maximum: 1
+        width:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+        height:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 1
+
+    PdfRegionV1:
+      type: object
+      additionalProperties: false
+      required: [page, bbox]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+          description: 1-based PDF 页码
+        bbox:
+          $ref: "#/components/schemas/PdfBoundingBoxV1"
+
+    PdfSourceLocatorV1:
+      allOf:
+        - $ref: "#/components/schemas/RealSourceLocatorBaseV1"
+        - type: object
+          required: [kind, regions]
+          properties:
+            kind:
+              type: string
+              const: pdf
+            regions:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/PdfRegionV1"
+      unevaluatedProperties: false
+
+    DocxTablePathEntryV1:
+      type: object
+      additionalProperties: false
+      required: [tableIndex, rowIndex, cellIndex]
+      properties:
+        tableIndex:
+          type: integer
+          minimum: 0
+        rowIndex:
+          type: integer
+          minimum: 0
+        cellIndex:
+          type: integer
+          minimum: 0
+
+    DocxTextRangeV1:
+      type: object
+      additionalProperties: false
+      required: [paragraphId, paragraphIndex, tablePath, charStart, charEnd]
+      properties:
+        paragraphId:
+          type: [string, "null"]
+          minLength: 1
+          description: DOCX 稳定段落标识；源文档未提供时为 null
+        paragraphIndex:
+          type: integer
+          minimum: 0
+        tablePath:
+          type: array
+          description: 非表格段落为空数组；表格内容保存嵌套表/行/单元格路径
+          items:
+            $ref: "#/components/schemas/DocxTablePathEntryV1"
+        charStart:
+          type: integer
+          minimum: 0
+        charEnd:
+          type: integer
+          minimum: 1
+          description: 段落或单元格中的 UTF-16 半开区间终点，必须大于 charStart
+
+    DocxSourceLocatorV1:
+      allOf:
+        - $ref: "#/components/schemas/RealSourceLocatorBaseV1"
+        - type: object
+          required: [kind, ranges]
+          properties:
+            kind:
+              type: string
+              const: docx
+            ranges:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/DocxTextRangeV1"
+      unevaluatedProperties: false
+
+    TxtPositionV1:
+      type: object
+      additionalProperties: false
+      required: [line, column]
+      properties:
+        line:
+          type: integer
+          minimum: 1
+          description: 1-based 物理行号
+        column:
+          type: integer
+          minimum: 0
+          description: 0-based UTF-16 列号
+
+    TxtSourceLocatorV1:
+      allOf:
+        - $ref: "#/components/schemas/RealSourceLocatorBaseV1"
+        - type: object
+          required: [kind, start, end]
+          properties:
+            kind:
+              type: string
+              const: txt
+            start:
+              $ref: "#/components/schemas/TxtPositionV1"
+            end:
+              $ref: "#/components/schemas/TxtPositionV1"
+      unevaluatedProperties: false
+
+    SourceLocator:
+      oneOf:
+        - $ref: "#/components/schemas/DevelopmentSourceLocator"
+        - $ref: "#/components/schemas/PdfSourceLocatorV1"
+        - $ref: "#/components/schemas/DocxSourceLocatorV1"
+        - $ref: "#/components/schemas/TxtSourceLocatorV1"
+      discriminator:
+        propertyName: kind
+        mapping:
+          development-fixture: "#/components/schemas/DevelopmentSourceLocator"
+          pdf: "#/components/schemas/PdfSourceLocatorV1"
+          docx: "#/components/schemas/DocxSourceLocatorV1"
+          txt: "#/components/schemas/TxtSourceLocatorV1"
 
     Requirement:
       type: object
       additionalProperties: false
+      oneOf:
+        - title: Historical or in-memory fixture requirement
+          properties:
+            extractionMethod:
+              type: string
+              const: development-fixture
+            confidence:
+              type: "null"
+            sourceLocator:
+              $ref: "#/components/schemas/DevelopmentSourceLocator"
+        - title: Real deterministic parser requirement
+          properties:
+            extractionMethod:
+              type: string
+              const: deterministic-rules-v1
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+            sourceLocator:
+              oneOf:
+                - $ref: "#/components/schemas/PdfSourceLocatorV1"
+                - $ref: "#/components/schemas/DocxSourceLocatorV1"
+                - $ref: "#/components/schemas/TxtSourceLocatorV1"
+              discriminator:
+                propertyName: kind
+                mapping:
+                  pdf: "#/components/schemas/PdfSourceLocatorV1"
+                  docx: "#/components/schemas/DocxSourceLocatorV1"
+                  txt: "#/components/schemas/TxtSourceLocatorV1"
       required:
         - id
         - projectId
@@ -675,6 +921,7 @@ components:
         - confirmationNote
         - confirmedAt
         - extractionMethod
+        - confidence
         - sourceLocator
         - createdAt
         - updatedAt
@@ -713,9 +960,17 @@ components:
             - type: "null"
         extractionMethod:
           type: string
-          const: development-fixture
+          enum: [development-fixture, deterministic-rules-v1]
+          description: |
+            `development-fixture` 仅用于内存/历史兼容；
+            `deterministic-rules-v1` 表示数字文档的真实确定性提取。
+        confidence:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: fixture 必须为 null；真实确定性结果为 0–1 数值
         sourceLocator:
-          $ref: "#/components/schemas/DevelopmentSourceLocator"
+          $ref: "#/components/schemas/SourceLocator"
         createdAt:
           $ref: "#/components/schemas/Timestamp"
         updatedAt:

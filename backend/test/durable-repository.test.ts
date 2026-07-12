@@ -1,6 +1,9 @@
+import type { Pool } from 'pg'
 import { describe, expect, it } from 'vitest'
-import type { NewUpload, Requirement } from '../src/domain/models.js'
+import type { NewUpload, ParseTaskType, Requirement } from '../src/domain/models.js'
+import { sha256Hex } from '../src/domain/source-locator.js'
 import { InMemoryBidRepository } from '../src/infrastructure/memory/in-memory-repository.js'
+import { PostgresBidRepository } from '../src/infrastructure/postgres/postgres-repository.js'
 
 const tenantId = 'tenant-durable-test'
 const projectId = '01PROJECTDURABLE000000000'
@@ -8,7 +11,7 @@ const fileId = '01FILEDURABLE000000000000'
 const taskId = '01TASKDURABLE000000000000'
 const createdAt = '2026-07-10T00:00:00.000Z'
 
-function upload(): NewUpload {
+function upload(type: ParseTaskType = 'development-document-parse'): NewUpload {
   return {
     file: {
       id: fileId,
@@ -32,7 +35,7 @@ function upload(): NewUpload {
       tenantId,
       projectId,
       fileId,
-      type: 'development-document-parse',
+      type,
       status: 'queued',
       progress: 0,
       attempt: 0,
@@ -45,7 +48,9 @@ function upload(): NewUpload {
   }
 }
 
-async function repositoryWithUpload(): Promise<InMemoryBidRepository> {
+async function repositoryWithUpload(
+  type: ParseTaskType = 'development-document-parse',
+): Promise<InMemoryBidRepository> {
   const repository = new InMemoryBidRepository()
   await repository.createProject({
     id: projectId,
@@ -59,7 +64,7 @@ async function repositoryWithUpload(): Promise<InMemoryBidRepository> {
     createdAt,
     updatedAt: createdAt,
   })
-  await repository.createUpload(upload())
+  await repository.createUpload(upload(type))
   return repository
 }
 
@@ -79,6 +84,7 @@ function requirement(): Requirement {
     confirmationNote: null,
     confirmedAt: null,
     extractionMethod: 'development-fixture',
+    confidence: null,
     sourceLocator: {
       kind: 'development-fixture',
       fileId,
@@ -90,6 +96,34 @@ function requirement(): Requirement {
     },
     createdAt: '2026-07-10T00:00:02.000Z',
     updatedAt: '2026-07-10T00:00:02.000Z',
+  }
+}
+
+function realRequirement(change: Partial<Requirement> = {}): Requirement {
+  const canonicalText = 'The service must retain audit logs.'
+  const quote = 'must retain audit logs'
+  const textStart = canonicalText.indexOf(quote)
+  return {
+    ...requirement(),
+    extractionMethod: 'deterministic-rules-v1',
+    confidence: 0.875,
+    sourceLocator: {
+      version: 1,
+      kind: 'txt',
+      sourceFileId: fileId,
+      sourceFileName: 'fixture.txt',
+      sourceRevision: 1,
+      sourceSha256: 'a'.repeat(64),
+      quote,
+      quoteSha256: sha256Hex(quote),
+      textStart,
+      textEnd: textStart + quote.length,
+      sectionPath: ['Audit'],
+      parserVersion: 'deterministic-rules-v1',
+      start: { line: 1, column: textStart },
+      end: { line: 1, column: textStart + quote.length },
+    },
+    ...change,
   }
 }
 
@@ -364,5 +398,256 @@ describe('durable repository semantics', () => {
     expect(
       await repository.retryTask(tenantId, taskId, '2026-07-10T00:00:23.000Z'),
     ).toMatchObject({ status: 'queued', attempt: 0, error: null })
+  })
+
+  it('persists and reads real locator evidence with bounded confidence', async () => {
+    const repository = await repositoryWithUpload('document-parse-v1')
+    const claimed = await repository.claimTask(
+      tenantId,
+      taskId,
+      'worker-real',
+      '2026-07-10T00:00:01.000Z',
+      '2026-07-10T00:00:30.000Z',
+      3,
+    )
+
+    await expect(
+      repository.completeTask(
+        claimed!.lease,
+        [realRequirement()],
+        '2026-07-10T00:00:02.000Z',
+      ),
+    ).resolves.toMatchObject({ status: 'succeeded' })
+    await expect(repository.listRequirements(tenantId, projectId, {})).resolves.toMatchObject([
+      {
+        extractionMethod: 'deterministic-rules-v1',
+        confidence: 0.875,
+        sourceLocator: {
+          kind: 'txt',
+          sourceFileId: fileId,
+          sourceSha256: 'a'.repeat(64),
+        },
+      },
+    ])
+  })
+
+  it.each([
+    [
+      'file id',
+      {
+        sourceLocator: {
+          ...realRequirement().sourceLocator,
+          sourceFileId: '01OTHERFILESOURCE000000000',
+        },
+      },
+    ],
+    [
+      'file hash',
+      {
+        sourceLocator: {
+          ...realRequirement().sourceLocator,
+          sourceSha256: 'b'.repeat(64),
+        },
+      },
+    ],
+    [
+      'file name',
+      {
+        sourceLocator: {
+          ...realRequirement().sourceLocator,
+          sourceFileName: 'other.txt',
+        },
+      },
+    ],
+    ['confidence', { confidence: 1.001 }],
+  ])('rejects real completion with a mismatched %s', async (_label, change) => {
+    const repository = await repositoryWithUpload('document-parse-v1')
+    const claimed = await repository.claimTask(
+      tenantId,
+      taskId,
+      'worker-real',
+      '2026-07-10T00:00:01.000Z',
+      '2026-07-10T00:00:30.000Z',
+      3,
+    )
+
+    await expect(
+      repository.completeTask(
+        claimed!.lease,
+        [realRequirement(change as Partial<Requirement>)],
+        '2026-07-10T00:00:02.000Z',
+      ),
+    ).rejects.toThrow()
+    await expect(repository.findTask(tenantId, taskId)).resolves.toMatchObject({ status: 'running' })
+  })
+
+  it('enforces task type, extraction method, locator kind, extension, and media type together', async () => {
+    const developmentRepository = await repositoryWithUpload()
+    const developmentClaim = await developmentRepository.claimTask(
+      tenantId,
+      taskId,
+      'worker-development',
+      '2026-07-10T00:00:01.000Z',
+      '2026-07-10T00:00:30.000Z',
+      3,
+    )
+    await expect(
+      developmentRepository.completeTask(
+        developmentClaim!.lease,
+        [realRequirement()],
+        '2026-07-10T00:00:02.000Z',
+      ),
+    ).rejects.toThrow()
+
+    const realRepository = await repositoryWithUpload('document-parse-v1')
+    const realClaim = await realRepository.claimTask(
+      tenantId,
+      taskId,
+      'worker-real',
+      '2026-07-10T00:00:01.000Z',
+      '2026-07-10T00:00:30.000Z',
+      3,
+    )
+    await expect(
+      realRepository.completeTask(
+        realClaim!.lease,
+        [requirement()],
+        '2026-07-10T00:00:02.000Z',
+      ),
+    ).rejects.toThrow()
+
+    const txt = realRequirement().sourceLocator
+    const txtLocator = txt as Extract<
+      Requirement['sourceLocator'],
+      { kind: 'txt' }
+    >
+    const realBase = Object.fromEntries(
+      Object.entries(txtLocator).filter(([key]) => !['kind', 'start', 'end'].includes(key)),
+    ) as Omit<typeof txtLocator, 'kind' | 'start' | 'end'>
+    await expect(
+      realRepository.completeTask(
+        realClaim!.lease,
+        [
+          realRequirement({
+            sourceLocator: {
+              ...realBase,
+              kind: 'pdf',
+              regions: [
+                { page: 1, bbox: { x: 0.1, y: 0.1, width: 0.5, height: 0.1 } },
+              ],
+            },
+          }),
+        ],
+        '2026-07-10T00:00:02.000Z',
+      ),
+    ).rejects.toThrow()
+  })
+
+  it('rejects malformed persisted locator JSON before returning it', async () => {
+    const malformedRow = {
+      id: '01REQDURABLE0000000000000',
+      tenant_id: tenantId,
+      project_id: projectId,
+      file_id: fileId,
+      task_id: taskId,
+      code: 'REQ-001',
+      title: 'Malformed evidence',
+      description: 'Must not escape validation.',
+      category: 'technical',
+      priority: 'mandatory',
+      confirmation_status: 'pending',
+      confirmation_note: null,
+      confirmed_at: null,
+      extraction_method: 'deterministic-rules-v1',
+      confidence: '0.8750',
+      source_locator: { kind: 'txt', quote: 'incomplete' },
+      source_file_sha256: 'a'.repeat(64),
+      source_file_name: 'fixture.txt',
+      source_file_media_type: 'text/plain',
+      source_task_type: 'document-parse-v1',
+      created_at: createdAt,
+      updated_at: createdAt,
+    }
+    const pool = {
+      query: async () => ({ rows: [malformedRow], rowCount: 1 }),
+      end: async () => undefined,
+    } as unknown as Pool
+    const repository = new PostgresBidRepository(pool)
+
+    await expect(repository.listRequirements(tenantId, projectId, {})).rejects.toThrow()
+  })
+
+  it('rejects persisted real evidence attached to a development task before returning it', async () => {
+    const real = realRequirement()
+    const inconsistentRow = {
+      id: real.id,
+      tenant_id: real.tenantId,
+      project_id: real.projectId,
+      file_id: real.fileId,
+      task_id: real.taskId,
+      code: real.code,
+      title: real.title,
+      description: real.description,
+      category: real.category,
+      priority: real.priority,
+      confirmation_status: real.confirmationStatus,
+      confirmation_note: real.confirmationNote,
+      confirmed_at: real.confirmedAt,
+      extraction_method: real.extractionMethod,
+      confidence: String(real.confidence),
+      source_locator: real.sourceLocator,
+      source_file_sha256: 'a'.repeat(64),
+      source_file_name: 'fixture.txt',
+      source_file_media_type: 'text/plain',
+      source_task_type: 'development-document-parse',
+      created_at: real.createdAt,
+      updated_at: real.updatedAt,
+    }
+    const pool = {
+      query: async () => ({ rows: [inconsistentRow], rowCount: 1 }),
+      end: async () => undefined,
+    } as unknown as Pool
+    const repository = new PostgresBidRepository(pool)
+
+    await expect(repository.listRequirements(tenantId, projectId, {})).rejects.toThrow(
+      /real parser evidence is inconsistent/i,
+    )
+  })
+
+  it('rejects persisted evidence when the joined task type is corrupted', async () => {
+    const real = realRequirement()
+    const corruptedRow = {
+      id: real.id,
+      tenant_id: real.tenantId,
+      project_id: real.projectId,
+      file_id: real.fileId,
+      task_id: real.taskId,
+      code: real.code,
+      title: real.title,
+      description: real.description,
+      category: real.category,
+      priority: real.priority,
+      confirmation_status: real.confirmationStatus,
+      confirmation_note: real.confirmationNote,
+      confirmed_at: real.confirmedAt,
+      extraction_method: real.extractionMethod,
+      confidence: String(real.confidence),
+      source_locator: real.sourceLocator,
+      source_file_sha256: 'a'.repeat(64),
+      source_file_name: 'fixture.txt',
+      source_file_media_type: 'text/plain',
+      source_task_type: 'corrupted-task-type',
+      created_at: real.createdAt,
+      updated_at: real.updatedAt,
+    }
+    const pool = {
+      query: async () => ({ rows: [corruptedRow], rowCount: 1 }),
+      end: async () => undefined,
+    } as unknown as Pool
+    const repository = new PostgresBidRepository(pool)
+
+    await expect(repository.listRequirements(tenantId, projectId, {})).rejects.toThrow(
+      /real parser evidence is inconsistent/i,
+    )
   })
 })

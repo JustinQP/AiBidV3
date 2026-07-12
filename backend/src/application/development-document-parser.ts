@@ -53,6 +53,7 @@ export class DevelopmentDocumentParser {
       confirmationNote: null,
       confirmedAt: null,
       extractionMethod: 'development-fixture',
+      confidence: null,
       sourceLocator: {
         kind: 'development-fixture',
         fileId: file.id,
@@ -67,4 +68,3 @@ export class DevelopmentDocumentParser {
     }))
   }
 }
-

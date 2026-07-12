@@ -46,7 +46,7 @@ interface RequirementParams extends ProjectParams {
 
 const confirmationStatuses: ConfirmationStatus[] = ['pending', 'confirmed', 'rejected']
 const priorities: RequirementPriority[] = ['mandatory', 'important', 'normal']
-const supportedExtensions = new Set(['.pdf', '.doc', '.docx', '.txt'])
+const supportedExtensions = new Set(['.pdf', '.docx', '.txt'])
 const createProjectKeys = new Set(['name', 'code', 'customerName', 'ownerName', 'deadline'])
 const requirementConfirmationKeys = new Set(['status', 'note'])
 const rfc3339DateTime =
@@ -208,7 +208,7 @@ export async function registerRoutes(
       throw badRequest('INVALID_FILE_NAME', 'File name must contain 1 to 255 characters')
     }
     if (!supportedExtensions.has(extension)) {
-      throw unsupportedMediaType('UNSUPPORTED_FILE_TYPE', 'Only PDF, DOC, DOCX, and TXT files are accepted')
+      throw unsupportedMediaType('UNSUPPORTED_FILE_TYPE', 'Only PDF, DOCX, and TXT files are accepted')
     }
     const content = await part.toBuffer()
     if (part.file.truncated) {
@@ -236,7 +236,10 @@ export async function registerRoutes(
       tenantId,
       projectId,
       fileId,
-      type: 'development-document-parse',
+      type:
+        config.repositoryDriver === 'postgres'
+          ? 'document-parse-v1'
+          : 'development-document-parse',
       status: 'queued',
       progress: 0,
       attempt: 0,

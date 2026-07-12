@@ -29,6 +29,8 @@ const config: AppConfig = {
   redisClaimIdleMs: 60_000,
   workerId: null,
   workerConcurrency: 2,
+  parserTimeoutMs: 60_000,
+  parserMaxOldGenerationSizeMb: 256,
   taskLeaseMs: 30_000,
   taskHeartbeatMs: 10_000,
   taskMaxAttempts: 3,
@@ -48,6 +50,7 @@ interface ProjectDto {
 
 interface TaskDto {
   id: string
+  type: 'development-document-parse' | 'document-parse-v1'
   status: 'queued' | 'running' | 'succeeded' | 'failed'
   progress: number
 }
@@ -119,12 +122,14 @@ class PersistenceCheckFailingRepository extends UploadFailingRepository {
 describe('AiBid API', () => {
   let app: FastifyInstance
   let objectStorage: TestObjectStorage
+  let repository: InMemoryBidRepository
 
   beforeEach(async () => {
     objectStorage = new TestObjectStorage()
+    repository = new InMemoryBidRepository()
     app = await buildApp({
       config,
-      repository: new InMemoryBidRepository(),
+      repository,
       objectStorage,
     })
   })
@@ -246,7 +251,10 @@ describe('AiBid API', () => {
     })
     expect(uploaded.statusCode).toBe(202)
     const uploadData = uploaded.json<{ data: { file: { id: string }; task: TaskDto } }>().data
-    expect(uploadData.task.status).toBe('queued')
+    expect(uploadData.task).toMatchObject({
+      type: 'development-document-parse',
+      status: 'queued',
+    })
     expect([...objectStorage.objects.keys()]).toEqual([
       `tenants/${tenantId}/projects/${project.id}/files/${uploadData.file.id}/v1/original`,
     ])
@@ -288,6 +296,26 @@ describe('AiBid API', () => {
     })
     expect(otherTenantTask.statusCode).toBe(404)
   })
+
+  it.each(['legacy.doc', 'legacy.DOC'])(
+    'rejects new %s uploads before object or database side effects',
+    async (fileName) => {
+      const tenantId = 'tenant-legacy-doc'
+      const project = await createProject(app, tenantId, '旧版 Word 上传边界')
+
+      const uploaded = await uploadFile(app, tenantId, project.id, fileName, 'legacy word bytes')
+
+      expect(uploaded.statusCode).toBe(415)
+      expect(uploaded.json()).toMatchObject({
+        status: 415,
+        code: 'UNSUPPORTED_FILE_TYPE',
+        detail: 'Only PDF, DOCX, and TXT files are accepted',
+      })
+      await expect(repository.listProjectFiles(tenantId, project.id)).resolves.toEqual([])
+      await expect(repository.listProjectTasks(tenantId, project.id)).resolves.toEqual([])
+      expect(objectStorage.objects.size).toBe(0)
+    },
+  )
 
   it('does not create file or task records when object storage rejects an upload', async () => {
     const tenantId = 'tenant-storage-down'
